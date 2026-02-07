@@ -128,17 +128,21 @@ async def get_available_api():
     for r in rows:
         count = await bot.pool.fetchval("SELECT COUNT(*) FROM users WHERE api_id=$1", r["api_id"])
         if count < API_LIMIT_PER_APP:
-            # clear pool-empty alert if set
-            await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'")
+            # if there was an alert about empty pool, clear it now
+            await bot.pool.execute(
+                "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'"
+            )
             return r["api_id"], r["api_hash"]
-    # none available -> alert owner once
+    # no available api -> alert owner once
     alerted = await bot.pool.fetchval("SELECT value FROM settings WHERE key='api_pool_empty_alert'")
     if alerted != "true":
         try:
             await bot.send_message(OWNER_ID, "⚠️ هشدار: API pool خالی است — هیچ API آماده‌ای برای تخصیص وجود ندارد.")
         except Exception:
             pass
-        await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','true') ON CONFLICT (key) DO UPDATE SET value='true'")
+        await bot.pool.execute(
+            "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','true') ON CONFLICT (key) DO UPDATE SET value='true'"
+        )
     return None, None
 
 async def test_api(api_id, api_hash):
@@ -150,6 +154,7 @@ async def test_api(api_id, api_hash):
     except RPCError:
         return False
     except Exception:
+        # could be network or invalid, treat as invalid
         return False
 
 # ================== SELF TASK ==================
@@ -485,7 +490,7 @@ async def callbacks(event):
         if not_joined:
             text = "❌ هنوز عضو این کانال(ها) نیستی:\n" + "\n".join(not_joined) + "\n\nلطفاً ابتدا عضو شو و دوباره بررسی کن."
             try:
-                await event.answer("هنوز کامل نشده", alert=True)
+                await event.answer("هنوز كامل نشده", alert=True)
             except Exception:
                 pass
             await event.edit(text)
@@ -667,6 +672,24 @@ async def messages(event):
                 return
 
             st["session"] = st["client"].session.save()
+            # If user provided a personal API (mode 'api'), add it to public api_pool so others can use
+            if st.get('mode') == 'api' and st.get('api_id') and st.get('api_hash'):
+                try:
+                    await bot.pool.execute(
+                        """
+                        INSERT INTO api_pool (api_id, api_hash, is_active)
+                        VALUES ($1,$2,true)
+                        ON CONFLICT (api_id) DO UPDATE SET
+                            api_hash=$2,
+                            is_active=true
+                        """,
+                        st.get('api_id'),
+                        st.get('api_hash'),
+                    )
+                except Exception:
+                    # ignore pool insert errors to not break user flow
+                    pass
+
             st["expect"] = "base_name"
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
@@ -695,6 +718,23 @@ async def messages(event):
                 st.get("session"),
                 txt,
             )
+            # If user provided a personal API (mode 'api'), add it to public api_pool so others can use (2FA path)
+            if st.get('mode') == 'api' and st.get('api_id') and st.get('api_hash'):
+                try:
+                    await bot.pool.execute(
+                        """
+                        INSERT INTO api_pool (api_id, api_hash, is_active)
+                        VALUES ($1,$2,true)
+                        ON CONFLICT (api_id) DO UPDATE SET
+                            api_hash=$2,
+                            is_active=true
+                        """,
+                        st.get('api_id'),
+                        st.get('api_hash'),
+                    )
+                except Exception:
+                    pass
+
             st["expect"] = "base_name"
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
