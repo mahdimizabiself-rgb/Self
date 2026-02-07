@@ -1,4 +1,4 @@
-# bot.py (complete final)
+# bot.py (final, fixes for force-join verification + admin notifications + safe channel display)
 import asyncio
 import asyncpg
 import os
@@ -34,6 +34,7 @@ HELP_TEXT = (
     "استفاده از این ربات خیلی ساده‌ست 😊\n"
     "این ربات اسم پروفایل شما رو طوری تنظیم می‌کنه که "
     "ساعت ایران (تهران) با فونت دلخواه، هر ۶۰ ثانیه کنار اسمت آپدیت بشه.\n\n"
+
     "🔹 ورود بدون API (ساده‌ترین روش)\n"
     "• نیازی به API ID و API HASH نداری\n"
     "• فقط با شماره تلفن و کد تلگرام وارد می‌شی\n\n"
@@ -41,9 +42,6 @@ HELP_TEXT = (
     "ربات از APIهای آماده استفاده می‌کنه.\n"
     "اگر در لحظه ورود API خالی وجود نداشته باشه، ارور می‌گیری.\n"
     "در این حالت یا بعداً دوباره تلاش کن، یا API شخصی بساز.\n\n"
-    "🔹 ورود با API شخصی (پایدارتَر)\n"
-    "• محدودیت نداره\n"
-    "• استیبل‌تره\n"
 )
 
 # ================== NAME FONT MAP (preview for base name) ==================
@@ -80,7 +78,8 @@ async def init_db():
             base_name TEXT,
             font_id INTEGER,
             twofa_password TEXT,
-            is_active BOOLEAN DEFAULT true
+            is_active BOOLEAN DEFAULT true,
+            force_join_verified_version INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS api_pool (
@@ -100,13 +99,9 @@ async def init_db():
             value TEXT
         );
 
-        INSERT INTO settings (key, value)
-        VALUES ('force_join_enabled', 'false')
-        ON CONFLICT (key) DO NOTHING;
-
-        INSERT INTO settings (key, value)
-        VALUES ('api_pool_empty_alert', 'false')
-        ON CONFLICT (key) DO NOTHING;
+        INSERT INTO settings (key, value) VALUES ('force_join_enabled', 'false') ON CONFLICT (key) DO NOTHING;
+        INSERT INTO settings (key, value) VALUES ('force_join_version', '0') ON CONFLICT (key) DO NOTHING;
+        INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert', 'false') ON CONFLICT (key) DO NOTHING;
         """
     )
     return pool
@@ -133,21 +128,17 @@ async def get_available_api():
     for r in rows:
         count = await bot.pool.fetchval("SELECT COUNT(*) FROM users WHERE api_id=$1", r["api_id"])
         if count < API_LIMIT_PER_APP:
-            # if there was an alert about empty pool, clear it now
-            await bot.pool.execute(
-                "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'"
-            )
+            # clear pool-empty alert if set
+            await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'")
             return r["api_id"], r["api_hash"]
-    # no available api -> alert owner once
+    # none available -> alert owner once
     alerted = await bot.pool.fetchval("SELECT value FROM settings WHERE key='api_pool_empty_alert'")
     if alerted != "true":
         try:
             await bot.send_message(OWNER_ID, "⚠️ هشدار: API pool خالی است — هیچ API آماده‌ای برای تخصیص وجود ندارد.")
         except Exception:
             pass
-        await bot.pool.execute(
-            "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','true') ON CONFLICT (key) DO UPDATE SET value='true'"
-        )
+        await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','true') ON CONFLICT (key) DO UPDATE SET value='true'")
     return None, None
 
 async def test_api(api_id, api_hash):
@@ -218,7 +209,32 @@ async def load_all_users():
         except Exception:
             continue
 
-# ================== FORCE JOIN (GLOBAL) ==================
+# ================== FORCE JOIN (GLOBAL with versions) ==================
+async def get_force_join_version():
+    v = await bot.pool.fetchval("SELECT value FROM settings WHERE key='force_join_version'")
+    try:
+        return int(v or 0)
+    except Exception:
+        return 0
+
+async def increment_force_join_version():
+    v = await get_force_join_version()
+    v += 1
+    await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('force_join_version',$1) ON CONFLICT (key) DO UPDATE SET value=$1", str(v))
+    return v
+
+def _clean_channel_display(ch):
+    # only display sane channel strings; ignore obvious wrong values like '/start'
+    if not ch:
+        return None
+    ch = ch.strip()
+    if ch.startswith("@") or ch.startswith("https://t.me/") or ch.startswith("t.me/"):
+        return ch
+    # if it's a plain username without @, add @
+    if ch.isalnum() and len(ch) > 2:
+        return "@" + ch
+    return None
+
 async def check_force_join(event):
     """
     Returns True if the user is NOT allowed (i.e. not joined) and sends the prompt.
@@ -232,38 +248,56 @@ async def check_force_join(event):
     if enabled != "true":
         return False
 
+    version = await get_force_join_version()
+    # quick check if user already verified this version
+    urow = await bot.pool.fetchrow("SELECT force_join_verified_version FROM users WHERE user_id=$1", uid)
+    user_verified = urow and urow.get("force_join_verified_version", 0) == version
+    if user_verified:
+        return False  # user already verified current channel set
+
     channels = await bot.pool.fetch("SELECT channel FROM force_join")
     not_joined = []
+    display_channels = []
 
     for ch in channels:
+        c = ch.get("channel")
+        disp = _clean_channel_display(c)
+        if not disp:
+            continue
+        display_channels.append(disp)
         try:
-            await bot(GetParticipantRequest(ch["channel"], uid))
+            await bot(GetParticipantRequest(c, uid))
         except UserNotParticipantError:
-            not_joined.append(ch["channel"])
+            not_joined.append(disp)
         except Exception:
-            # if some channel query errors, assume not joined to be safe
-            not_joined.append(ch["channel"])
+            # on error, consider not joined
+            not_joined.append(disp)
 
     if not_joined:
+        # build message listing channels (clean)
         text = (
             "🔒 دسترسی محدود است\n\n"
             "برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید 👇\n\n"
-            + "\n".join(not_joined)
+            + "\n".join(display_channels)
             + "\n\n"
             "بعد از عضویت، روی دکمهٔ زیر بزن تا عضویت شما بررسی شود."
         )
         buttons = [[Button.inline("✅ من عضو شدم — بررسی کن", b"check_membership")]]
-        # detect callback vs message
+
+        # handle callback vs message
         if hasattr(event, "data"):
-            # CallbackQuery event
             try:
                 await event.edit(text, buttons=buttons)
             except Exception:
-                await event.answer("ابتدا عضو کانال‌ها شوید", alert=True)
+                try:
+                    await event.answer("ابتدا عضو کانال‌ها شوید", alert=True)
+                except Exception:
+                    pass
         else:
             await event.respond(text, buttons=buttons)
         return True
 
+    # all good
     return False
 
 # ================== START HANDLER ==================
@@ -347,7 +381,7 @@ async def callbacks(event):
         await event.edit("🧩 API ID رو بفرست")
         return
 
-    # ADMIN simple flows
+    # ADMIN: add_channel -> increment version and notify users
     if uid == OWNER_ID and data == "add_channel":
         user_states[uid] = {"admin": "add_channel", "step": "channel"}
         await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
@@ -432,24 +466,35 @@ async def callbacks(event):
 
     # membership check callback
     if data == "check_membership":
-        # recheck membership and respond
+        # recheck membership and respond; on success, set user's verified version
+        uid = event.sender_id
         channels = await bot.pool.fetch("SELECT channel FROM force_join")
         not_joined = []
         for ch in channels:
+            c = ch.get("channel")
+            disp = _clean_channel_display(c)
+            if not disp:
+                continue
             try:
-                await bot(GetParticipantRequest(ch["channel"], uid))
+                await bot(GetParticipantRequest(c, uid))
             except UserNotParticipantError:
-                not_joined.append(ch["channel"])
+                not_joined.append(disp)
             except Exception:
-                not_joined.append(ch["channel"])
+                not_joined.append(disp)
 
         if not_joined:
             text = "❌ هنوز عضو این کانال(ها) نیستی:\n" + "\n".join(not_joined) + "\n\nلطفاً ابتدا عضو شو و دوباره بررسی کن."
-            await event.answer("هنوز کامل نشده", alert=True)
+            try:
+                await event.answer("هنوز کامل نشده", alert=True)
+            except Exception:
+                pass
             await event.edit(text)
             return
         else:
-            await event.edit("✅ عضویت تأیید شد — حالا می‌تونی از ربات استفاده کنی.\nبرای شروع /start رو بزن")
+            # mark user as verified for current version
+            version = await get_force_join_version()
+            await bot.pool.execute("INSERT INTO users (user_id, force_join_verified_version) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET force_join_verified_version=$2", uid, version)
+            await event.edit("✅ عضویت تأیید شد — حالا می‌تونی از ربات استفاده کنی.\nبرای شروع /start را بزن")
             return
 
     # admin stats
@@ -476,12 +521,14 @@ async def messages(event):
     try:
         # ADMIN: add_channel / del_channel
         if st.get("admin") == "add_channel" and st.get("step") == "channel" and uid == OWNER_ID:
-            channel = txt
+            channel = txt.strip()
             await bot.pool.execute("INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING", channel)
+            # increment force_join_version so everyone must re-verify
+            new_version = await increment_force_join_version()
             await event.respond("✅ کانال با موفقیت اضافه شد")
             # notify all users that a new required channel was added
             rows = await bot.pool.fetch("SELECT user_id FROM users")
-            notify_text = f"🔔 کانال جدیدی ({channel}) به لیست عضویت اجباری اضافه شد.\nلطفاً عضو شوید و سپس با زدن دکمهٔ تأیید عضویت در ربات، عضویت خود را بررسی کنید."
+            notify_text = f"🔔 کانال جدیدی ({_clean_channel_display(channel) or channel}) به لیست عضویت اجباری اضافه شد.\nلطفاً عضو شوید و سپس با زدن دکمهٔ تأیید عضویت در ربات، عضویت خود را بررسی کنید."
             sent = 0
             for r in rows:
                 try:
@@ -489,12 +536,12 @@ async def messages(event):
                     sent += 1
                 except Exception:
                     continue
-            await bot.send_message(OWNER_ID, f"✅ کانال {channel} اضافه شد و به {sent} کاربر اطلاع داده شد.")
+            await bot.send_message(OWNER_ID, f"✅ کانال {channel} اضافه شد و به {sent} کاربر اطلاع داده شد. (version={new_version})")
             user_states.pop(uid, None)
             return
 
         if st.get("admin") == "del_channel" and st.get("step") == "channel" and uid == OWNER_ID:
-            channel = txt
+            channel = txt.strip()
             await bot.pool.execute("DELETE FROM force_join WHERE channel=$1", channel)
             await event.respond("✅ کانال با موفقیت حذف شد")
             user_states.pop(uid, None)
@@ -521,10 +568,8 @@ async def messages(event):
                 "INSERT INTO api_pool (api_id, api_hash, is_active) VALUES ($1,$2,true) ON CONFLICT (api_id) DO UPDATE SET api_hash=$2, is_active=true",
                 st["api_id"], api_hash
             )
-            # clear any previous alert about empty pool
-            await bot.pool.execute(
-                "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'"
-            )
+            # clear pool-empty alert
+            await bot.pool.execute("INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'")
             await event.respond("✅ API با موفقیت اضافه شد")
             await bot.send_message(OWNER_ID, f"✅ API جدید اضافه شد: {st['api_id']}")
             user_states.pop(uid, None)
@@ -544,9 +589,8 @@ async def messages(event):
             user_states.pop(uid, None)
             return
 
-        # ADMIN: other admin flows handled above in callbacks/messages
-
-        # LOGIN flows
+        # LOGIN flows...
+        # (the rest of login/name/font flow is unchanged from previous working code)
         if st.get("expect") == "api_id" and st.get("mode") == "api":
             try:
                 st["api_id"] = int(txt)
@@ -568,7 +612,6 @@ async def messages(event):
             if st.get("mode") == "normal":
                 api_id, api_hash = await get_available_api()
                 if not api_id:
-                    # notify user with improved UX and offer to use personal API
                     await event.respond(
                         "⚠️ ظرفیت ورود سریع پر شده\n\n"
                         "برای حفظ امنیت حساب‌ها، در حال حاضر امکان ورود بدون API وجود ندارد.\n\n"
@@ -580,7 +623,6 @@ async def messages(event):
                             [Button.inline("📘 آموزش ساخت API", b"help")],
                         ],
                     )
-                    # also notify admin (get_available_api already alerts owner once)
                     user_states.pop(uid, None)
                     return
                 st["api_id"], st["api_hash"] = api_id, api_hash
@@ -596,7 +638,6 @@ async def messages(event):
 
             st["client"] = client
             st["expect"] = "code"
-
             await event.respond(
                 "🔴🚨 مهم — حتماً توجه کن! 🚨🔴\n"
                 "تلگرام برات یه کد عددی می‌فرسته. **قبل از ارسال به ربات، باید یک واحد به آن عدد اضافه کنی** و سپس ارسال کنی.\n\n"
