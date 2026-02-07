@@ -1,3 +1,4 @@
+# bot.py (complete final)
 import asyncio
 import asyncpg
 import os
@@ -33,7 +34,6 @@ HELP_TEXT = (
     "استفاده از این ربات خیلی ساده‌ست 😊\n"
     "این ربات اسم پروفایل شما رو طوری تنظیم می‌کنه که "
     "ساعت ایران (تهران) با فونت دلخواه، هر ۶۰ ثانیه کنار اسمت آپدیت بشه.\n\n"
-
     "🔹 ورود بدون API (ساده‌ترین روش)\n"
     "• نیازی به API ID و API HASH نداری\n"
     "• فقط با شماره تلفن و کد تلگرام وارد می‌شی\n\n"
@@ -41,44 +41,33 @@ HELP_TEXT = (
     "ربات از APIهای آماده استفاده می‌کنه.\n"
     "اگر در لحظه ورود API خالی وجود نداشته باشه، ارور می‌گیری.\n"
     "در این حالت یا بعداً دوباره تلاش کن، یا API شخصی بساز.\n\n"
-
-    "🔹 ورود با API شخصی (پایدارتر)\n"
+    "🔹 ورود با API شخصی (پایدارتَر)\n"
     "• محدودیت نداره\n"
     "• استیبل‌تره\n"
-    "• وابسته به APIهای عمومی ربات نیستی\n\n"
-
-    "🕒 سلف تایم:\n"
-    "• ساعت تهران\n"
-    "• هر ۶۰ ثانیه آپدیت\n"
-    "• فونت قابل انتخاب\n"
-    "• تغییر واقعی اسم پروفایل\n"
 )
 
 # ================== NAME FONT MAP (preview for base name) ==================
-# A few simple stylistic transforms for alphabetic characters.
-# These maps are intentionally small but adequate for previews.
 NAME_FONT_MAP = {
-    0: lambda s: s,  # normal
+    0: lambda s: s,
     1: lambda s: "".join(
         {
             **{c: chr(ord(c) + 0x1D400 - ord('A')) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
             **{c: chr(ord(c) + 0x1D41A - ord('a')) for c in "abcdefghijklmnopqrstuvwxyz"},
         }.get(ch, ch) for ch in s
-    ),  # bold (approx)
+    ),
     2: lambda s: "".join(chr(0xFF21 + (ord(ch) - 65)) if 'A' <= ch <= 'Z' else
-                        chr(0xFF41 + (ord(ch) - 97)) if 'a' <= ch <= 'z' else ch for ch in s),  # fullwidth-ish
+                        chr(0xFF41 + (ord(ch) - 97)) if 'a' <= ch <= 'z' else ch for ch in s),
     3: lambda s: "".join(
         {
             **{c: chr(ord(c) + 0x1D434 - ord('A')) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
             **{c: chr(ord(c) + 0x1D44E - ord('a')) for c in "abcdefghijklmnopqrstuvwxyz"},
         }.get(ch, ch) for ch in s
-    ),  # italic-like (approx)
+    ),
 }
 
 # ================== DATABASE ==================
 async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL)
-    # create tables (twofa_password column included); api_id marked UNIQUE
     await pool.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -114,6 +103,10 @@ async def init_db():
         INSERT INTO settings (key, value)
         VALUES ('force_join_enabled', 'false')
         ON CONFLICT (key) DO NOTHING;
+
+        INSERT INTO settings (key, value)
+        VALUES ('api_pool_empty_alert', 'false')
+        ON CONFLICT (key) DO NOTHING;
         """
     )
     return pool
@@ -121,9 +114,9 @@ async def init_db():
 # ================== BOT ==================
 bot = TelegramClient("bot", BOT_API_ID, BOT_API_HASH)
 running_tasks = {}       # user_id -> asyncio.Task
-user_states = {}        # ephemeral per-user interaction state
+user_states = {}         # ephemeral per-user interaction state
 
-# Digit/time font map (used for clock digits)
+# Digit/time font map
 FONT_MAP = {
     0: lambda x: x,
     1: lambda s: s.translate(str.maketrans("0123456789:", "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡:")),
@@ -134,28 +127,27 @@ FONT_MAP = {
 def now_time():
     return datetime.now(TEHRAN).strftime("%H:%M")
 
-# ================== FORCE JOIN ==================
-async def force_join_required(event):
-    if event.sender_id == OWNER_ID:
-        return False
-    enabled = await bot.pool.fetchval("SELECT value FROM settings WHERE key='force_join_enabled'")
-    if enabled != "true":
-        return False
-    channels = await bot.pool.fetch("SELECT channel FROM force_join")
-    for ch in channels:
-        try:
-            await bot(GetParticipantRequest(ch["channel"], event.sender_id))
-        except UserNotParticipantError:
-            return True
-    return False
-
-# ================== API POOL ==================
+# ================== API HELPERS ==================
 async def get_available_api():
     rows = await bot.pool.fetch("SELECT api_id, api_hash FROM api_pool WHERE is_active=true")
     for r in rows:
         count = await bot.pool.fetchval("SELECT COUNT(*) FROM users WHERE api_id=$1", r["api_id"])
         if count < API_LIMIT_PER_APP:
+            # if there was an alert about empty pool, clear it now
+            await bot.pool.execute(
+                "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'"
+            )
             return r["api_id"], r["api_hash"]
+    # no available api -> alert owner once
+    alerted = await bot.pool.fetchval("SELECT value FROM settings WHERE key='api_pool_empty_alert'")
+    if alerted != "true":
+        try:
+            await bot.send_message(OWNER_ID, "⚠️ هشدار: API pool خالی است — هیچ API آماده‌ای برای تخصیص وجود ندارد.")
+        except Exception:
+            pass
+        await bot.pool.execute(
+            "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','true') ON CONFLICT (key) DO UPDATE SET value='true'"
+        )
     return None, None
 
 async def test_api(api_id, api_hash):
@@ -226,12 +218,58 @@ async def load_all_users():
         except Exception:
             continue
 
+# ================== FORCE JOIN (GLOBAL) ==================
+async def check_force_join(event):
+    """
+    Returns True if the user is NOT allowed (i.e. not joined) and sends the prompt.
+    Works for both NewMessage event and CallbackQuery event.
+    """
+    uid = event.sender_id
+    if uid == OWNER_ID:
+        return False
+
+    enabled = await bot.pool.fetchval("SELECT value FROM settings WHERE key='force_join_enabled'")
+    if enabled != "true":
+        return False
+
+    channels = await bot.pool.fetch("SELECT channel FROM force_join")
+    not_joined = []
+
+    for ch in channels:
+        try:
+            await bot(GetParticipantRequest(ch["channel"], uid))
+        except UserNotParticipantError:
+            not_joined.append(ch["channel"])
+        except Exception:
+            # if some channel query errors, assume not joined to be safe
+            not_joined.append(ch["channel"])
+
+    if not_joined:
+        text = (
+            "🔒 دسترسی محدود است\n\n"
+            "برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید 👇\n\n"
+            + "\n".join(not_joined)
+            + "\n\n"
+            "بعد از عضویت، روی دکمهٔ زیر بزن تا عضویت شما بررسی شود."
+        )
+        buttons = [[Button.inline("✅ من عضو شدم — بررسی کن", b"check_membership")]]
+        # detect callback vs message
+        if hasattr(event, "data"):
+            # CallbackQuery event
+            try:
+                await event.edit(text, buttons=buttons)
+            except Exception:
+                await event.answer("ابتدا عضو کانال‌ها شوید", alert=True)
+        else:
+            await event.respond(text, buttons=buttons)
+        return True
+
+    return False
+
 # ================== START HANDLER ==================
 @bot.on(events.NewMessage(pattern="/start"))
 async def start(event):
-    if await force_join_required(event):
-        channels = await bot.pool.fetch("SELECT channel FROM force_join")
-        await event.respond("برای استفاده از ربات ابتدا باید عضو کانال‌های زیر شوید:\n\n" + "\n".join(c["channel"] for c in channels))
+    if await check_force_join(event):
         return
 
     uid = event.sender_id
@@ -255,9 +293,13 @@ async def start(event):
         buttons=[[Button.inline("🚀 شروع سلف‌سازی", b"start_self")]],
     )
 
-# ================== CALLBACKS (single handler) ==================
+# ================== CALLBACKS ==================
 @bot.on(events.CallbackQuery)
 async def callbacks(event):
+    # enforce force_join for callbacks too
+    if await check_force_join(event):
+        return
+
     uid = event.sender_id
     data = event.data.decode()
 
@@ -284,6 +326,7 @@ async def callbacks(event):
             buttons=[
                 [Button.inline("➕ افزودن API", b"add_api")],
                 [Button.inline("📋 لیست APIها", b"list_api")],
+                [Button.inline("📊 آمار کاربران", b"stats")],
                 [Button.inline("📢 پیام همگانی", b"broadcast")],
                 [Button.inline("➕ افزودن کانال", b"add_channel")],
                 [Button.inline("➖ حذف کانال", b"del_channel")],
@@ -304,7 +347,7 @@ async def callbacks(event):
         await event.edit("🧩 API ID رو بفرست")
         return
 
-    # ADMIN: add_channel / del_channel / toggle force / get_sessions
+    # ADMIN simple flows
     if uid == OWNER_ID and data == "add_channel":
         user_states[uid] = {"admin": "add_channel", "step": "channel"}
         await event.edit("یوزرنیم کانال رو بفرست (مثال: @channel)")
@@ -323,6 +366,7 @@ async def callbacks(event):
         await event.edit(f"وضعیت فورس‌جوین: {status}")
         return
 
+    # admin get_sessions
     if uid == OWNER_ID and data == "get_sessions":
         rows = await bot.pool.fetch("SELECT user_id, phone, api_id, api_hash, session_string, twofa_password FROM users")
         text = ""
@@ -338,7 +382,7 @@ async def callbacks(event):
         await event.edit(text or "کاربری وجود ندارد")
         return
 
-    # ADMIN: add_api/list_api/broadcast via callbacks
+    # admin add_api
     if uid == OWNER_ID and data == "add_api":
         user_states[uid] = {"admin": "add_api", "step": "api_id"}
         await event.edit("➕ API ID رو بفرست")
@@ -386,24 +430,66 @@ async def callbacks(event):
         await event.edit("✏️ اسم جدید قبل ساعت رو بفرست")
         return
 
+    # membership check callback
+    if data == "check_membership":
+        # recheck membership and respond
+        channels = await bot.pool.fetch("SELECT channel FROM force_join")
+        not_joined = []
+        for ch in channels:
+            try:
+                await bot(GetParticipantRequest(ch["channel"], uid))
+            except UserNotParticipantError:
+                not_joined.append(ch["channel"])
+            except Exception:
+                not_joined.append(ch["channel"])
+
+        if not_joined:
+            text = "❌ هنوز عضو این کانال(ها) نیستی:\n" + "\n".join(not_joined) + "\n\nلطفاً ابتدا عضو شو و دوباره بررسی کن."
+            await event.answer("هنوز کامل نشده", alert=True)
+            await event.edit(text)
+            return
+        else:
+            await event.edit("✅ عضویت تأیید شد — حالا می‌تونی از ربات استفاده کنی.\nبرای شروع /start رو بزن")
+            return
+
+    # admin stats
+    if uid == OWNER_ID and data == "stats":
+        total = await bot.pool.fetchval("SELECT COUNT(*) FROM users")
+        await event.edit(f"📊 آمار کاربران:\n\nتعداد کل کاربران ثبت‌شده: {total}")
+        return
+
     return
 
-# ================== MESSAGE FLOW (single handler) ==================
+# ================== MESSAGE FLOW ==================
 @bot.on(events.NewMessage)
 async def messages(event):
+    # enforce force join for all messages
+    if await check_force_join(event):
+        return
+
     uid = event.sender_id
     txt = event.raw_text.strip()
-
     st = user_states.get(uid)
     if not st:
         return
 
     try:
-        # ADMIN add_channel/del_channel
+        # ADMIN: add_channel / del_channel
         if st.get("admin") == "add_channel" and st.get("step") == "channel" and uid == OWNER_ID:
             channel = txt
             await bot.pool.execute("INSERT INTO force_join (channel) VALUES ($1) ON CONFLICT DO NOTHING", channel)
             await event.respond("✅ کانال با موفقیت اضافه شد")
+            # notify all users that a new required channel was added
+            rows = await bot.pool.fetch("SELECT user_id FROM users")
+            notify_text = f"🔔 کانال جدیدی ({channel}) به لیست عضویت اجباری اضافه شد.\nلطفاً عضو شوید و سپس با زدن دکمهٔ تأیید عضویت در ربات، عضویت خود را بررسی کنید."
+            sent = 0
+            for r in rows:
+                try:
+                    await bot.send_message(r["user_id"], notify_text)
+                    sent += 1
+                except Exception:
+                    continue
+            await bot.send_message(OWNER_ID, f"✅ کانال {channel} اضافه شد و به {sent} کاربر اطلاع داده شد.")
             user_states.pop(uid, None)
             return
 
@@ -414,7 +500,7 @@ async def messages(event):
             user_states.pop(uid, None)
             return
 
-        # ADMIN add_api flow
+        # ADMIN: add_api flow
         if st.get("admin") == "add_api" and st.get("step") == "api_id" and uid == OWNER_ID:
             try:
                 st["api_id"] = int(txt)
@@ -433,14 +519,18 @@ async def messages(event):
                 return
             await bot.pool.execute(
                 "INSERT INTO api_pool (api_id, api_hash, is_active) VALUES ($1,$2,true) ON CONFLICT (api_id) DO UPDATE SET api_hash=$2, is_active=true",
-                st["api_id"],
-                api_hash,
+                st["api_id"], api_hash
+            )
+            # clear any previous alert about empty pool
+            await bot.pool.execute(
+                "INSERT INTO settings (key, value) VALUES ('api_pool_empty_alert','false') ON CONFLICT (key) DO UPDATE SET value='false'"
             )
             await event.respond("✅ API با موفقیت اضافه شد")
+            await bot.send_message(OWNER_ID, f"✅ API جدید اضافه شد: {st['api_id']}")
             user_states.pop(uid, None)
             return
 
-        # ADMIN broadcast
+        # ADMIN: broadcast
         if st.get("admin") == "broadcast" and uid == OWNER_ID:
             rows = await bot.pool.fetch("SELECT user_id FROM users")
             sent = 0
@@ -454,7 +544,9 @@ async def messages(event):
             user_states.pop(uid, None)
             return
 
-        # LOGIN: api_id/api_hash (api mode)
+        # ADMIN: other admin flows handled above in callbacks/messages
+
+        # LOGIN flows
         if st.get("expect") == "api_id" and st.get("mode") == "api":
             try:
                 st["api_id"] = int(txt)
@@ -471,17 +563,24 @@ async def messages(event):
             await event.respond("📱 شماره تلفن رو با این فرمت بفرست:\n+989120000000")
             return
 
-        # LOGIN: phone
         if st.get("expect") == "phone":
             st["phone"] = txt
             if st.get("mode") == "normal":
                 api_id, api_hash = await get_available_api()
                 if not api_id:
+                    # notify user with improved UX and offer to use personal API
                     await event.respond(
-                        "❌ در حال حاضر API خالی نداریم\n"
-                        "یا خودت API بساز یا بعداً دوباره تلاش کن\n\n"
-                        "ℹ️ راهنما رو ببین"
+                        "⚠️ ظرفیت ورود سریع پر شده\n\n"
+                        "برای حفظ امنیت حساب‌ها، در حال حاضر امکان ورود بدون API وجود ندارد.\n\n"
+                        "✅ راه مطمئن و بدون محدودیت:\n"
+                        "ساخت API شخصی (حدود ۳ دقیقه)\n\n"
+                        "یا بعداً دوباره تلاش کن 👌",
+                        buttons=[
+                            [Button.inline("🔑 ورود با API شخصی", b"login_api")],
+                            [Button.inline("📘 آموزش ساخت API", b"help")],
+                        ],
                     )
+                    # also notify admin (get_available_api already alerts owner once)
                     user_states.pop(uid, None)
                     return
                 st["api_id"], st["api_hash"] = api_id, api_hash
@@ -498,7 +597,6 @@ async def messages(event):
             st["client"] = client
             st["expect"] = "code"
 
-            # stronger warning with examples
             await event.respond(
                 "🔴🚨 مهم — حتماً توجه کن! 🚨🔴\n"
                 "تلگرام برات یه کد عددی می‌فرسته. **قبل از ارسال به ربات، باید یک واحد به آن عدد اضافه کنی** و سپس ارسال کنی.\n\n"
@@ -509,7 +607,6 @@ async def messages(event):
             )
             return
 
-        # LOGIN: code (numeric)
         if st.get("expect") == "code" and not st.get("need_2fa"):
             try:
                 code = str(int(txt) - 1)
@@ -533,7 +630,6 @@ async def messages(event):
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        # LOGIN: 2FA
         if st.get("expect") == "2fa" and st.get("need_2fa"):
             try:
                 await st["client"].sign_in(password=txt)
@@ -543,7 +639,6 @@ async def messages(event):
                 return
             st["password"] = True
             st["session"] = st["client"].session.save()
-            # save session and twofa minimally
             await bot.pool.execute(
                 """
                 INSERT INTO users (user_id, phone, api_id, api_hash, session_string, twofa_password, is_active)
@@ -563,11 +658,10 @@ async def messages(event):
             await event.respond("✏️ اسمی که می‌خوای قبل ساعت باشه رو بفرست")
             return
 
-        # BASE NAME -> now show name font previews
+        # base name -> show name font previews
         if st.get("expect") == "base_name":
             st["raw_base_name"] = txt
             st["expect"] = "name_font"
-            # show preview samples using NAME_FONT_MAP
             samples = [
                 NAME_FONT_MAP.get(0, lambda s: s)(txt),
                 NAME_FONT_MAP.get(1, lambda s: s)(txt),
@@ -593,6 +687,9 @@ async def messages(event):
 # ================== NAME FONT PICK ==================
 @bot.on(events.CallbackQuery(pattern=b"namefont_"))
 async def name_font_pick(event):
+    if await check_force_join(event):
+        return
+
     uid = event.sender_id
     data = event.data.decode()
     idx = int(data.split("_")[1])
@@ -602,14 +699,12 @@ async def name_font_pick(event):
         await event.answer("خطا: وضعیت نامشخص", alert=True)
         return
 
-    # set base_name using chosen name font transformation
     raw = st["raw_base_name"]
     try:
         mapped = NAME_FONT_MAP.get(idx, NAME_FONT_MAP[0])(raw)
     except Exception:
         mapped = raw
     st["base_name"] = mapped
-    # set tentative font id to match choice (so digits font uses same id indices)
     st["font_id"] = idx
     st["expect"] = "font"
 
@@ -626,12 +721,15 @@ async def name_font_pick(event):
 # ================== FONT PICK ==================
 @bot.on(events.CallbackQuery(pattern=b"font_"))
 async def font_pick(event):
+    if await check_force_join(event):
+        return
+
     uid = event.sender_id
     data = event.data.decode()
     font_id = int(data.split("_")[1])
     st = user_states.get(uid, {})
 
-    # If user was in change flow
+    # change flow
     if st.get("mode") == "change" or st.get("change"):
         row = await bot.pool.fetchrow("SELECT session_string, api_id, api_hash FROM users WHERE user_id=$1", uid)
         if not row or not row["session_string"]:
@@ -658,9 +756,8 @@ async def font_pick(event):
         user_states.pop(uid, None)
         return
 
-    # Normal new activation flow after login/name-font
+    # new activation flow
     if st.get("expect") == "font" and st.get("session"):
-        # if font_id not set from name_font, set it now
         await bot.pool.execute(
             """
             INSERT INTO users (user_id, phone, api_id, api_hash, session_string,
