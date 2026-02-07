@@ -490,7 +490,7 @@ async def callbacks(event):
         if not_joined:
             text = "❌ هنوز عضو این کانال(ها) نیستی:\n" + "\n".join(not_joined) + "\n\nلطفاً ابتدا عضو شو و دوباره بررسی کن."
             try:
-                await event.answer("هنوز كامل نشده", alert=True)
+                await event.answer("هنوز کامل نشده", alert=True)
             except Exception:
                 pass
             await event.edit(text)
@@ -876,12 +876,40 @@ async def font_pick(event):
 
     await event.answer("خطا: وضعیت نامشخص", alert=True)
 
-# ================== MAIN ==================
+# ================== MAIN (FloodWait-handled) ==================
 async def main():
     bot.pool = await init_db()
-    await bot.start(bot_token=BOT_TOKEN)
-    await load_all_users()
-    await bot.run_until_disconnected()
+
+    # Handle FloodWait when starting the bot to avoid crashing/restarts on Render
+    while True:
+        try:
+            await bot.start(bot_token=BOT_TOKEN)
+            print("[bot] started successfully")
+            break
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", None) or getattr(e, "time", None) or 60
+            try:
+                wait = int(wait)
+            except Exception:
+                wait = 60
+            print(f"[bot] FloodWait detected — sleeping {wait} seconds")
+            await asyncio.sleep(wait + 5)
+        except Exception as e:
+            print(f"[bot] unexpected error on start: {e}")
+            await asyncio.sleep(10)
+
+    # load active users' tasks
+    try:
+        await load_all_users()
+    except Exception as e:
+        print(f"[bot] load_all_users error: {e}")
+
+    # keep bot running
+    try:
+        await bot.run_until_disconnected()
+    except Exception as e:
+        print(f"[bot] run_until_disconnected error: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
